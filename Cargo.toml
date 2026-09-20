@@ -1,0 +1,24 @@
+[package]
+name = "tongchou"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "离线任务统筹、多模型 token 预算与重置额度管理 CLI"
+license = "MIT"
+repository = "https://github.com/ZEPHYR65537/rustychedule"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+fs2 = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+unicode-width = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
