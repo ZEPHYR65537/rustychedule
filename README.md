@@ -1,6 +1,6 @@
 # Rustychedule · Schedule
 
-Rust 编写的任务与多模型用量管理 CLI。主命令 **schedule**，短命令 **tc**；两者完全等价。当前版本 **0.2.0**。
+Rust 编写的任务与多模型用量管理 CLI。主命令 **schedule**，短命令 **tc**；两者完全等价。当前版本 **0.3.0**。
 
 按重要性、紧迫性、截止时间和依赖安排任务；按用户指定的模型偏序分配工作。每个模型分别维护订阅额度、API token 上限、已用量和任务预留。只管理用量，不记录金额、单价或费用，也不调用模型或替用户购买额度。
 
@@ -77,45 +77,58 @@ tc reset --models strong --windows week --source tibo
 
 卡 ID 7 只是示例，先查看实际 ID。reset 仅登记外部已经发生的刷新；卡扣一次库存，Tibo 不扣卡。自然周重置自动按时间计算。所有订阅重置都不补充 API、不删除历史或未用预留。不能把尚未发生的 Tibo 计入计划。
 
-## 项目与跨机器同步
+## Agent 项目与跨设备同步
 
-已有代码仓库继续保存代码；工作空间仓库集中保存任务、用量、上下文、长期记忆和原仓库列表。本机目录绑定独立存放。以下 my-project 是注册项目的稳定名称：
+**逻辑任务负责规划，agent 项目负责工作容器和资料。** 两者可多对多关联，也可独立使用。一个 agent 项目 A 可以有 X/Y/Z 多个文件夹；文件夹内还可以有子目录、聊天摘要和多个代码仓库。
 
-~~~sh
-tc project register my-project ./my-existing-repo
-tc project note my-project --context "当前目标与约束" --memory "长期约定与关键决策"
-tc task edit 1 --project my-project
-tc project status
-tc project diff my-project
-~~~
-
-先在自己的 GitHub 账号下创建一个**空的私有** schedule-workspace 仓库，再连接：
+先在自己的 GitHub 下创建空的私有 `schedule-workspace` 仓库，配置 Git 认证，再执行：
 
 ~~~sh
 tc hub init ../schedule-hub --github YOUR_ACCOUNT
-tc hub status
+tc machine alias 台式机
+tc agent create A --provider codex
+tc agent import A ./X                  # 预览
+tc agent import A ./X --apply
+tc agent import A ./Y --apply
+tc agent folder A Z
+tc agent tree A
+tc hub check
+tc hub diff
 tc hub push
 ~~~
 
---github 只根据账号生成地址，不创建 GitHub 仓库、不处理登录。账号名不是认证凭据；认证复用 Git。日常查看离线，只有明确的同步/检出操作联网。
-
-另一台机器：
+无独立 Git 仓库的工作文件由 CLI 托管，不必先判断哪些是记忆。遇到代码仓库时只保存索引：有 GitHub/可携带远程就记录地址，否则记录机器别名和本地路径。**本地路径索引不是代码备份。** 代码仓库内部未推送的资料不会随中央索引上传。
 
 ~~~sh
-tc hub clone https://github.com/YOUR_ACCOUNT/schedule-workspace.git ../schedule-hub
-tc hub pull
-tc project bind my-project ./existing-checkout
-# 或从原仓库克隆到新目录：
-tc project checkout my-project --to ./new-checkout
+tc repo add code ./existing-repo
+tc agent attach A code --parent X
+tc repo status
+tc agent collect X --apply              # 来源/中央双边修改会停止
+tc agent link A --task 1                # 可选关联，不改变任务或用量
 ~~~
 
-没有原远程仓库的项目默认 snapshot 模式：先在原项目提交代码，再 tc project snapshot NAME，随后 hub push；恢复使用 project checkout。快照包含 HEAD 可达的提交历史，限 90 MiB，不含未提交/忽略文件、其他分支、子模块内容或 LFS 实体。大项目适合 reference 模式。
+另一台设备：
 
-采用“离开设备前 push，到新设备先 pull”的工作流。双端都改了状态时停止同步，避免静默覆盖；目前不自动合并离线编辑。--replace 明确接受远端状态前，先 export 留下独立备份。
+~~~sh
+tc hub clone https://github.com/YOUR_ACCOUNT/schedule-workspace.git ../schedule-hub --metadata-only
+tc hub pull --agents-only               # 不导入本机规划账本
+tc hub select A                        # 或选择某个文件夹
+tc machine alias 笔记本
+tc agent export A --to ./A --bind       # 恢复原目录结构；代码只列入口
+tc repo checkout code --to ./A/X/code   # 按需从原仓库克隆
+# 如果还需要逻辑任务与用量，再执行 tc hub pull
+~~~
+
+支持重命名、移动、拆分、保留来源分区的合并、归档与节点删除；结构与正文使用普通 Git 文件维护。`hub commit` 本地保存，`hub push/pull` 同步当前分支。分支合并先在临时工作树检查，文本或结构冲突不会覆盖原工作树。规划账本保持独立冲突保护，不自动拼接用量记录。
+
+旧版工作空间先用 `tc hub migrate` 预览、`tc hub migrate --apply` 升级，再提交推送。旧文件和 bundle 保存在 `legacy/v02`，其他旧设备直接 pull 跟随中央身份。新格式使用 `agent/repo`，旧 `project` 命令仅供旧格式兼容。
+
+完整工作流、排除规则、机器定位、按需同步和迁移见 [Agent 工作空间使用指南](docs/AGENT_WORKSPACES.md)。
 
 ## 文档与实现
 
-- [落地设计与完整工作流](docs/IMPLEMENTATION_V2.md)
+- [v0.3 落地设计与验收约束](docs/IMPLEMENTATION_V3.md)
+- [Agent 工作空间使用指南](docs/AGENT_WORKSPACES.md)
 - [CLI 指令清单](docs/CLI.md)
 - [维护的数据结构与存储布局](docs/DATA_MODEL.md)
 - [数学定义、资源约束与降级算例](docs/MATHEMATICS.md)
@@ -135,4 +148,4 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ~~~
 
-未来会扩展周容量学习、任务用量预测、自动采集与多设备实体级合并；本版保留观测和复盘资料，尚不实现预测。
+export/import 只备份规划账本；agent 元信息与正文由独立 sync Git 仓库备份。未来扩展周容量学习、任务用量预测和自动采集，本版尚不实现预测。

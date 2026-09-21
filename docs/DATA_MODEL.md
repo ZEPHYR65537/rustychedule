@@ -1,8 +1,43 @@
-# 数据结构与存储布局 · v0.2
+# 数据结构与存储布局 · v0.3
 
-本版状态 schema version=2。Rust 定义见 src/domain.rs、src/ledger.rs、src/workspace.rs。JSON 是可读的主存储格式；没有数据库和外部服务。
+规划状态 schema version=2，旧 hub 格式=1，新 hub 格式=2。程序版本 0.3.0 与存储版本独立。Rust 定义见 src/domain.rs、src/ledger.rs、src/agents.rs。没有数据库和独立历史服务。
 
-## 便携状态 State
+## Agent 工作空间（新 hub 格式 2）
+
+| 结构 | 字段与用途 |
+|---|---|
+| Agent | id、name、description、bindings、tasks、archived、merged_into。平台工作容器；tasks 是逻辑任务 ID 集合，不保存或计算用量。 |
+| agents::Binding | provider、source。可记录平台项目/聊天 URL 或 ID，不读取未开放的云端状态。与 domain::Binding 的额度折算完全不同。 |
+| Node | id、agent、parent、name、kind、repository、origin_agent、source、tasks。kind=folder/repository/conversation；父节点只能是同一项目的 folder。仓库节点不存正文。 |
+| Repository | id、name、remote、locations、legacy。remote 为无凭据可携带 URL；locations 支持多机器位置；legacy 仅用于旧版恢复/来源。 |
+| Location | machine、path。机器稳定 ID 与当地绝对路径，按用户要求同步以定位纯本地仓库。 |
+| Machine | id、alias。别名可改、在工作空间内不重复，身份不变。 |
+| Catalog | agents/nodes/repos/machines 四个 BTreeMap；磁盘上一条记录一个 JSON，不保存整个派生总表。 |
+| Device | id、alias、sources、selection。只在本机 device.json 保存，不随 hub 克隆。selection=null 为全部，[] 为元信息，其他为 agent/节点 ID。 |
+| SourceBinding | path、directories、baseline、excludes。本机来源目录、相对目录到稳定节点 ID 的映射、上次文件 SHA-256、排除规则。每节点每数据目录一个活动来源。 |
+| LocalSettings | hub、旧 paths、base_state_hash。本机连接和规划同步基准；旧路径保留给迁移使用。 |
+
+新实体用随机 128 位 ID，不靠名称或路径认定身份。逻辑任务的旧数值 ID 保持不变；账本不自动合并。名称与单个文件名跨平台校验，同级大小写碰撞、父子循环和无效引用会阻止提交。
+
+```text
+sync/
+  .schedule-hub.json          # version=2, application=schedule, workspace_id
+  planning/state.json        # 规划 State 的同步副本
+  catalog/agents/<id>.json
+  catalog/nodes/<id>.json
+  catalog/repos/<id>.json
+  catalog/machines/<id>.json
+  content/<node-id>/<file>    # 直属文件；子目录通过节点关系记录
+  legacy/v02/                # 仅迁移后存在，保留旧文件与 bundle
+```
+
+catalog 与 content 是真实可编辑文件，不是从规划 State 再生成的视图。文件夹移动/改名只改变元信息；导出时重建用户的 A/X/Y/Z 目录。节点引用代码仓库而不包含源码；repository.remote 为空时 locations/legacy 至少一个存在。多个项目可引用同一仓库。
+
+新格式的本地设备身份、采集基准与正文选择在数据目录 device.json。不要把 device.json 复制给另一台设备，换设备 clone hub 后会产生新身份。工作空间锁与中断恢复事务放在当前工作树的 Git 管理目录中，不上传。事务覆盖一次受管文件操作；Git、网络和本机配置不是分布式全原子事务。
+
+agent 内容可独立推拉；规划 JSON 使用旧有指纹保护。临时工作树合并后验证元信息与 Git 文件类型；有文本冲突、结构碰撞或双方账本变动时停止。未检出的正文不是删除。完整流程见 AGENT_WORKSPACES.md。
+
+## 便携规划状态 State
 
 | 字段 | Rust 类型 | 含义 |
 |---|---|---|
@@ -18,7 +53,7 @@
 | model_preferences | Vec<[String; 2]> | 全局模型偏序边 |
 | funding_policy | FundingPolicy | subscription-first / model-first / subscription-only |
 | sessions | Vec<WorkSession> | 工作复盘 |
-| projects | Vec<Project> | 便携项目注册表、上下文和长期记忆 |
+| projects | Vec<Project> | v0.2 兼容登记；迁移时原样保留，新 agent 数据独立存储 |
 
 tasks、budgets、credits、events、sessions 共用 ID 序列。模型名、项目名是稳定键，不用本机路径当标识。当前 IDs 不是多设备全局唯一：双端离线修改时拒绝自动合并，不能手工把 JSON 数组拼起来。
 
@@ -104,7 +139,7 @@ Funding 是 subscription 或 api；它代表额度来源，与金额无关。缓
 
 默认数据目录及旧路径回退规则见 README。export 只导出便携 State，不导出 LocalSettings 或认证材料。实体名字与 URL 不应包含秘密；CLI 不采集 API key，但用户自由填写的 note/memory 仍属于同步内容。
 
-## Git 工作空间目录
+## 旧 Git 工作空间目录（格式 1，仅历史兼容）
 
 ~~~text
 schedule-hub/
@@ -125,11 +160,11 @@ schedule-hub/
     project.bundle        # 同上；HEAD 可达提交历史
 ~~~
 
-除 workspace/state.json 外的 task/project JSON、Markdown 是便于阅读的生成视图。请通过 CLI 修改上下文；直接在 GitHub 编辑这些派生文件不会回写 State，下次 push 会重新生成。Snapshot 元数据与 bundle 是恢复项目需要的文件，不是从 State 重建的视图。
+以下说明仅适用于旧 hub 格式 1：除 workspace/state.json 外的 task/project JSON、Markdown 是便于阅读的生成视图。请通过 CLI 修改上下文；直接在 GitHub 编辑这些派生文件不会回写 State，下次 push 会重新生成。Snapshot 元数据与 bundle 是恢复项目需要的文件，不是从 State 重建的视图。
 
 reference 项目不复制源码；源代码仍在原仓库独立提交/推送。路径映射留在本机，换设备需 bind 或 checkout。hub push 仅暂存受管路径；已有未知已暂存文件会阻止操作，任意未跟踪文件不会一起上传。受管路径拒绝符号链接和路径穿越；快照校验 SHA-256。
 
-## 同步与冲突
+## 旧格式同步与规划账本冲突保护
 
 以序列化 State 的 SHA-256 比较本机当前、上次同步基线、远端三者。远端无变更时保留本机修改；本机无变更时接受远端；两端都修改且不同则失败。只快进合并、不 force push。镜像存在未提交更改时 pull 拒绝覆盖；未推送快照也会触发此保护。
 

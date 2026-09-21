@@ -173,6 +173,9 @@ pub enum HubCommand {
     Clone {
         remote: String,
         path: PathBuf,
+        /// 只检出目录信息；请求 partial clone，节省传输取决于服务器支持
+        #[arg(long)]
+        metadata_only: bool,
     },
     Remote {
         url: String,
@@ -180,11 +183,42 @@ pub enum HubCommand {
     /// 展示本地同步摘要，不访问网络
     Status,
     /// 生成本地结构化索引，提交并推送工作空间（显式联网）
-    Push,
+    Push {
+        /// 不导出本机规划账本；推送仍包含当前 Git 分支已提交的历史
+        #[arg(long)]
+        agents_only: bool,
+    },
     /// 下载状态并安全导入；双端变更拒绝覆盖，--replace 显式接受远端
     Pull {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "agents_only")]
         replace: bool,
+        /// 只更新 agent 工作空间，不导入本机规划账本
+        #[arg(long)]
+        agents_only: bool,
+    },
+    /// 校验目录结构、正文与规划副本
+    Check,
+    /// 工作空间文件差异、未暂存和已暂存状态
+    Diff,
+    /// 本地提交受管文件（不联网）
+    Commit {
+        #[arg(
+            short,
+            long,
+            default_value = "workspace: update agent structure and content"
+        )]
+        message: String,
+    },
+    /// 选择本机项目/文件夹正文；不传目标只保留元信息，--all 恢复全部
+    Select {
+        agents: Vec<String>,
+        #[arg(long, conflicts_with = "agents")]
+        all: bool,
+    },
+    /// 预览 v0.2 hub 迁移；--apply 保存，旧文件保留在 legacy/v02
+    Migrate {
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -550,6 +584,13 @@ pub fn work(c: WorkCommand, s: &mut State, now: Time) -> Result<Response> {
 }
 pub fn project(c: ProjectCommand, s: &mut State, store: &Store) -> Result<Response> {
     let mut local = LocalSettings::load(store)?;
+    ensure!(
+        local
+            .hub
+            .as_ref()
+            .is_none_or(|p| crate::hub::format(p).ok() != Some(2)),
+        "此工作空间已升级；使用 repo 管理仓库索引、agent 管理容器。旧记录已保留，不再用 project 覆盖记忆"
+    );
     match c {
         ProjectCommand::Register {
             name,
@@ -706,6 +747,25 @@ pub fn project(c: ProjectCommand, s: &mut State, store: &Store) -> Result<Respon
     }
 }
 pub fn hub(c: HubCommand, s: &mut State, store: &Store) -> Result<Response> {
+    let local = LocalSettings::load(store)?;
+    let legacy = local
+        .hub
+        .as_ref()
+        .is_some_and(|p| crate::hub::format(p).ok() == Some(1));
+    if !legacy
+        || !matches!(
+            c,
+            HubCommand::Status
+                | HubCommand::Remote { .. }
+                | HubCommand::Push { .. }
+                | HubCommand::Pull { .. }
+        )
+    {
+        return crate::agent_cli::hub_command(c, s, store);
+    }
+    legacy_hub(c, s, store)
+}
+fn legacy_hub(c: HubCommand, s: &mut State, store: &Store) -> Result<Response> {
     let mut local = LocalSettings::load(store)?;
     match c {
         HubCommand::Init {
@@ -738,7 +798,7 @@ pub fn hub(c: HubCommand, s: &mut State, store: &Store) -> Result<Response> {
                 false,
             ))
         }
-        HubCommand::Clone { remote, path } => {
+        HubCommand::Clone { remote, path, .. } => {
             let path = workspace::clone_hub(&remote, &path)?;
             local.hub = Some(path.clone());
             local.base_state_hash = None;
@@ -785,7 +845,11 @@ pub fn hub(c: HubCommand, s: &mut State, store: &Store) -> Result<Response> {
                 false,
             ))
         }
-        HubCommand::Push => {
+        HubCommand::Push { agents_only } => {
+            ensure!(
+                !agents_only,
+                "旧格式不支持独立 agent 同步；请先 hub migrate"
+            );
             let commit = workspace::push(s, &mut local)?;
             local.save(store)?;
             Ok(response(
@@ -794,7 +858,26 @@ pub fn hub(c: HubCommand, s: &mut State, store: &Store) -> Result<Response> {
                 false,
             ))
         }
-        HubCommand::Pull { replace } => {
+        HubCommand::Pull {
+            replace,
+            agents_only,
+        } => {
+            if let Some(remote) = crate::hub::pull_upgrade(s, &mut local, agents_only, replace)? {
+                if !agents_only {
+                    store.save(&remote)?;
+                    *s = remote;
+                }
+                local.save(store)?;
+                return Ok(response(
+                    json!({"pulled":true,"upgraded":true,"agents_only":agents_only}),
+                    "已跟随中央迁移升级，使用相同 agent/仓库身份；本机机器身份未复制。".into(),
+                    false,
+                ));
+            }
+            ensure!(
+                !agents_only,
+                "旧格式不支持独立 agent 同步；请先 hub migrate"
+            );
             let remote = workspace::pull(s, &mut local, replace)?;
             store.save(&remote)?;
             *s = remote;
@@ -805,5 +888,6 @@ pub fn hub(c: HubCommand, s: &mut State, store: &Store) -> Result<Response> {
                 false,
             ))
         }
+        _ => anyhow::bail!("请先 hub migrate 升级工作空间"),
     }
 }

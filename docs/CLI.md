@@ -1,4 +1,4 @@
-# CLI 指令清单 · v0.2
+# CLI 指令清单 · v0.3
 
 schedule、tc 完全等价，tongchou 为旧兼容入口。以下统一写 tc。所有子命令支持 --help；全局 --data PATH、--json 可放在子命令前或后。默认无子命令等于 dashboard。帮助为中文，数据枚举使用英文稳定值。
 
@@ -14,7 +14,7 @@ schedule、tc 完全等价，tongchou 为旧兼容入口。以下统一写 tc。
 | tc plan [--minutes 240] [--reserve-percent 10] [--project NAME] [--rebalance] [--commit] | 预览排程；commit 保存预留；rebalance 释放所选项目范围内未用预算再排 |
 | tc report [--days 7] | 按模型和额度来源展示原始 token、每日趋势 |
 | tc doctor | 数据校验、版本与目录 |
-| tc export <PATH> [--force] | 导出便携状态；覆盖已存在文件需 force |
+| tc export <PATH> [--force] | 导出规划账本（不含 agent 正文）；覆盖已存在文件需 force |
 | tc import <PATH> [--replace] | 校验后导入；非空状态需要 replace |
 
 plan 只使用当前额度，不预测未来重置。分钟数是本次连续可工作时间，不是日历范围。任务放不下时显示暂缓原因，不会留下部分新预留。
@@ -114,25 +114,58 @@ work log 可只记时间/完成内容；记 token 时必须提供 model。带模
 
 不填卡适用模型/窗口表示不限该维度。一次合法 reset 操作扣一次卡库存，即使作用于多个允许模型；模型账本仍各自刷新。过期、范围不匹配、次数不足时整次失败。--windows 省略时为选定模型全部订阅窗口。默认保留自然周期相位；restart-clock 才改为现在+周期。自然重置无需命令。以上操作不作用于 API。
 
-## 项目与同步
+## Agent 项目、文件夹和聊天
+
+与规划任务独立。名称支持中文，歧义时使用完整 ID 或至少 10 字符的唯一 ID 前缀。命令里的 NAME/ID 均可用可唯一解析的名称。
 
 | 命令 | 作用 |
 |---|---|
-| tc project register <NAME> <PATH> [--mode reference\|snapshot] [--remote URL] [--description TEXT] | 注册 Git 仓库；自动检测 origin，有可携带远程时 reference，否则 snapshot |
-| tc project bind <NAME> <PATH> | 绑定本机已有 Git 仓库，不修改代码 |
-| tc project checkout <NAME> --to <NEWPATH> | 引用模式从原仓库克隆，快照模式从 bundle 恢复；只写新目录 |
-| tc project status | 所有注册仓库分支、提交、改动数、关联任务及未绑定提示 |
-| tc project diff <NAME> | 本机跟踪文件 diff 统计及包含未跟踪文件的状态清单 |
-| tc project note <NAME> [--context TEXT\|--context-file PATH] [--memory TEXT\|--memory-file PATH] | 替换指定上下文/长期记忆 |
-| tc project snapshot <NAME> | snapshot 模式的已提交 HEAD 历史打包；原代码不变，之后 push 才上传 |
-| tc project show <NAME> | 项目说明、记忆和任务列表 |
-| tc hub init <PATH> [--remote URL\|--github OWNER] [--repo schedule-workspace] | 初始化空的专用镜像；github 根据账号生成 URL，私有仓库需预先创建 |
-| tc hub clone <REMOTE> <NEWPATH> | 克隆既有工作空间；随后 pull 导入任务数据 |
-| tc hub remote <URL> | 设置/更换镜像 origin |
-| tc hub status | 本机状态是否已变、镜像 Git 更改；不联网 |
-| tc hub push | 检查远端、生成索引、提交并推送 main；不推送引用项目代码 |
-| tc hub pull [--replace] | 获取并快进镜像，校验、导入状态；双端修改时停止，replace 明确接受远端 |
+| tc agent create NAME [--provider TOOL] [--source URL_OR_ID] | 建立容器身份，不创建平台服务端项目 |
+| tc agent list [--all] | 默认活动项目，all 含归档 |
+| tc agent tree [AGENT] / show AGENT | 树状结构 / 项目元信息 |
+| tc agent bind AGENT --provider TOOL --source URL_OR_ID | 增加平台来源绑定 |
+| tc agent folder AGENT NAME [--parent NODE] | 空文件夹 |
+| tc agent import AGENT PATH [--name NAME] [--parent NODE] [--exclude PATTERN] [--apply] | 默认预览；纳管正文，嵌套 Git 仓库转索引；exclude 可重复 |
+| tc agent collect NODE [--apply] [--prune] | 根据本机来源基准收集；prune 需 apply，才传播安全的来源删除 |
+| tc agent export AGENT --to NEWPATH [--bind] | 恢复目录树和仓库清单；bind 将顶层文件夹设为本机后续收集来源 |
+| tc agent path NODE | 中央直属正文位置 |
+| tc agent find QUERY [--agent AGENT] | 本地 UTF-8 正文搜索，单文件至多 2 MiB；报告未检出的节点 |
+| tc agent rename AGENT NAME / rename-node NODE NAME | 更名，身份不变 |
+| tc agent move NODE [--agent AGENT] [--parent NODE] | 移动子树；无 parent 为项目根；省略 agent 时由 parent 或原归属推定 |
+| tc agent split NODE --name NAME | 子树成为新容器的根文件夹 |
+| tc agent merge FROM INTO [--apply] | 默认预览；保留来源分组和旧项目去向 |
+| tc agent archive AGENT [--restore] | 归档/恢复，正文保留；合并的撤销使用 Git |
+| tc agent remove NODE [--apply] | 默认预览；删除中央子树，apply 前须提交；源文件、仓库索引、逻辑任务不动 |
+| tc agent link TARGET --task ID [--task ID] [--remove] | 项目或节点到逻辑任务的多对多关联 |
+| tc agent chat AGENT TITLE --source URL_OR_ID [--provider manual] [--parent NODE] [--summary FILE] | 聊天来源及交接摘要 |
+| tc agent attach AGENT REPO [--parent NODE] [--name NAME] | 引用已有仓库 |
 
-项目名称使用 1–64 位小写 ASCII 字母、数字、-、_，拒绝路径穿越和 Windows 设备名。引用项目远程支持不带凭据的 HTTPS、git@host:path；本机文件路径仅留在 local.json。hub 支持普通 Git URL 和本地 bare 仓库路径；不要把密码/token 拼进远程 URL，应使用 Git 凭据管理器/SSH。
+## 机器与代码仓库
 
-v0.2 采用单写端交接，不自动合并离线编辑，也不提供自动创建私有仓库、后台同步、模型调用或自动学习。
+| 命令 | 作用 |
+|---|---|
+| tc machine alias NAME | 设置本机别名；稳定 ID 不变，可在连接 hub 前设置 |
+| tc machine list | 共享机器列表及本机身份 |
+| tc repo add NAME [PATH] [--remote URL] | 路径/remote 至少一个；本地注册检测 origin，记录机器位置 |
+| tc repo bind REPO PATH | 绑定本机已有仓库；有 origin 时核对远程身份 |
+| tc repo remote REPO URL | 更新索引 remote，不改原仓库配置 |
+| tc repo status [REPO] / show REPO | 本机 Git 改动、已有上游落后/领先数 / 完整登记 |
+| tc repo checkout REPO --to NEWPATH | 从原远程克隆；旧 bundle 可恢复；仅本地路径则提示来源机器 |
+
+## Sync 仓库
+
+| 命令 | 作用 |
+|---|---|
+| tc hub init PATH [--remote URL\|--github OWNER] [--repo schedule-workspace] | 新建格式 2 的专用工作空间；GitHub 仓库需预先创建 |
+| tc hub clone REMOTE NEWPATH [--metadata-only] | 克隆；metadata-only 请求 partial clone 并只检出目录信息，传输节省取决于服务端 |
+| tc hub remote URL | 设置 origin |
+| tc hub status / diff / check | 离线状态 / 差异统计 / 目录与内容校验 |
+| tc hub commit [-m MESSAGE] | 仅提交受管文件，不联网；未知已暂存文件会阻止操作 |
+| tc hub select [AGENT_OR_NODE ...] [--all] | 选择项目/文件夹正文；无目标为仅元信息；all 恢复全部 |
+| tc hub push [--agents-only] | 提交并推送当前分支；agents-only 不导出本机规划账本 |
+| tc hub pull [--agents-only\|--replace] | 先验证 Git 合并；agents-only 不导入本机账本；replace 明确接受中央账本，不替你解决 Git 分叉 |
+| tc hub migrate [--apply] | v0.2 迁移预览/执行；旧文件保留在 legacy/v02 |
+
+GitHub 账号只用于生成地址；Git 负责认证。不要在 URL 拼接密码或 token。hub 也支持本地 bare remote，便于离线验证。agents-only 仍推拉当前分支的 Git 历史，不能过滤已提交的其他内容。
+
+旧 `project register/bind/checkout/status/diff/note/snapshot/show` 仅用于未迁移的旧 hub；旧实现行为见 IMPLEMENTATION_V2.md。新格式不再默认制作代码快照。

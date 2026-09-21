@@ -1,5 +1,7 @@
 # v0.2 落地设计
 
+历史版本文档。v0.3 的项目模型、机器索引和 Git 同步以 IMPLEMENTATION_V3.md、AGENT_WORKSPACES.md 为准；本文的用量规划语义继续保留。
+
 日期：2026-09-21。仓库：ZEPHYR65537/rustychedule。CLI 名称 schedule，短名 tc。本文描述已实现行为；尚未实现的预测等内容明确列于末节。
 
 ## 使用循环

@@ -19,8 +19,8 @@ use std::{collections::BTreeMap, path::PathBuf};
 #[command(
     name = "schedule",
     version,
-    about = "统筹：任务优先级 × 独立模型额度 × token 预算",
-    after_help = "短命令 tc 与 schedule 完全等价。不带子命令显示总览。\n快速体验：tc --data demo init --demo\n日常：tc task add / tc plan / tc work log / tc project status / tc hub push"
+    about = "统筹：逻辑任务 × 独立模型用量 × agent 工作空间",
+    after_help = "短命令 tc 与 schedule 完全等价。不带子命令显示任务总览。\n快速体验：tc --data demo init --demo\n规划：tc task add / tc plan / tc work log\n资料：tc agent tree / tc repo status / tc hub push"
 )]
 pub struct Cli {
     /// 数据目录（默认使用系统用户数据目录）
@@ -34,6 +34,21 @@ pub struct Cli {
 }
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Agent 工作容器、文件夹、聊天与持久资料（独立于逻辑任务）
+    Agent {
+        #[command(subcommand)]
+        command: crate::agent_cli::AgentCommand,
+    },
+    /// 代码仓库索引：远程地址或机器＋本地路径
+    Repo {
+        #[command(subcommand)]
+        command: crate::agent_cli::RepoCommand,
+    },
+    /// 当前机器身份与可共享别名
+    Machine {
+        #[command(subcommand)]
+        command: crate::agent_cli::MachineCommand,
+    },
     /// 订阅续期日、估计周额度
     Subscription {
         #[command(subcommand)]
@@ -54,7 +69,7 @@ pub enum Command {
         #[command(subcommand)]
         command: WorkCommand,
     },
-    /// 注册原代码仓库、统一查看更改、维护上下文与记忆
+    /// v0.2 兼容命令；新版请使用 agent / repo
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
@@ -124,7 +139,7 @@ pub enum Command {
         #[arg(long, default_value_t = 7)]
         days: u32,
     },
-    /// 完整导出 JSON 备份
+    /// 导出规划账本 JSON（agent 正文由 hub Git 仓库备份）
     Export {
         path: PathBuf,
         #[arg(long)]
@@ -494,6 +509,9 @@ fn factors(values: &[String]) -> Result<BTreeMap<String, f64>> {
 
 pub fn execute(command: Command, s: &mut State, store: &Store, now: Time) -> Result<Response> {
     match command {
+        Command::Agent { command } => crate::agent_cli::agent(command, s, store),
+        Command::Repo { command } => crate::agent_cli::repo(command, store),
+        Command::Machine { command } => crate::agent_cli::machine(command, store),
         Command::Subscription { command } => commands::subscription(command, s, now),
         Command::Api { command } => commands::api(command, s, now),
         Command::Policy { command } => commands::policy(command, s),

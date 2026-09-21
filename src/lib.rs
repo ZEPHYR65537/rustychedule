@@ -1,6 +1,10 @@
+pub mod agent_cli;
+pub mod agent_files;
+pub mod agents;
 pub mod cli;
 pub mod commands;
 pub mod domain;
+pub mod hub;
 pub mod ledger;
 pub mod planner;
 pub mod store;

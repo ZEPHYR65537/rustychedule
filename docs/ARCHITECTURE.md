@@ -1,4 +1,4 @@
-# 模块架构 · v0.2
+# 模块架构 · v0.3
 
 ## 分层
 
@@ -10,7 +10,11 @@
 | src/domain.rs | 任务/模型/窗口/预留/事件/卡、校验、当前额度、重置 |
 | src/ledger.rs | ModelAccount、Subscription、Funding、FundingPolicy、WorkSession；API 独立余额 |
 | src/planner.rs | 依赖优先级继承、偏序极大元、来源策略、整数可行性、预留与重规划 |
-| src/workspace.rs | 项目注册、本机绑定、Git 聚合、bundle、中心仓库索引与冲突检测 |
+| src/workspace.rs | v0.2 兼容项目/bundle/同步，及共享 Git 调用 |
+| src/agents.rs | 稳定身份、机器/仓库/容器/节点、结构校验、hub 锁与文件事务 |
+| src/agent_files.rs | Git 排除规则、仓库边界、三方文件收集、目录导出 |
+| src/agent_cli.rs | agent/repo/machine 与新版 hub 命令、树和状态展示 |
+| src/hub.rs | 格式 2、分支同步、临时工作树合并校验、正文选择、旧 hub 迁移 |
 | src/store.rs | 数据目录、文件锁、原子写、备份、v1→v2 解码迁移 |
 | src/ui.rs | 中文表格、可见宽度、控制符处理、四象限、额度条、排程与趋势 |
 | tests/core.rs、tests/cli.rs、tests/v2.rs | 数学约束、CLI 事务、用量来源、项目与双端同步回归 |
@@ -33,7 +37,7 @@ CLI 解析 → 打开数据目录并持锁 → 读取/迁移/验证 State → �
 6. 生成时间表、模型来源片段、警告和暂缓原因。
 7. 默认不保存；commit 新增预算。rebalance 先在副本释放范围内未用预留。
 
-## 同步路径
+## 旧格式同步路径
 
 hub push：检查标识 → 查询/获取远端 → 状态指纹和 Git 祖先检查 → 生成受管索引 → 仅暂存受管文件 → commit → push → 保存基线指纹。
 
@@ -44,3 +48,15 @@ reference 源码不通过 hub 传输。snapshot 从干净已提交仓库生成 H
 ## 扩展接口
 
 未来预测读 Event + WorkSession + Task，并引入显式估计版本；自动采集经幂等入口写 Event。任何新功能不能绕过模型/来源独立约束，不能以已用 token 替代成果。完整数据结构、未实现功能和决策见 DATA_MODEL.md、ROADMAP.md、DECISIONS.md。
+
+## 新格式执行与同步
+
+agent/repo/machine 命令不返回规划 State.changed，结构操作从 hub 的真实 catalog 读取，经过图与路径校验后，以可恢复文件事务修改 JSON 和正文。Device.sources 保存独立来源基准；文件双方变更停止，源不可访问不删除。HubLock 与 Store 锁分别保护同一工作树、同一 data 目录，普通 Git 命令仍由用户自行协调。
+
+hub push：校验格式/目录 → fetch 当前分支 → 拒绝非祖先远端 → 可选导出规划 → 仅 stage 受管文件 → commit → push 当前同名分支 → 保存规划基准。
+
+hub pull：本工作树须干净 → fetch → 阻止分支双方账本变动 → 临时工作树做 Git 合并及结构校验 → 独立检查本机规划冲突 → 合并原工作树 → 可选导入规划 → 恢复本机正文选择。临时工作树只默认检出完整 catalog/planning；索引校验还拒绝托管子模块、链接和未经登记的嵌套正文路径。
+
+catalog 永远完整，content 可以稀疏检出。导出重建目录语义；不把内部 ID 存储布局冒充原执行环境。来源采集是明确命令，不后台监听；export --bind 允许在恢复的目录继续工作并 collect 回来。
+
+旧 hub 在主设备一次迁移；保留 planning 原始语义、legacy 文件和已存在快照。其他旧设备快进到中央迁移后复用其身份。只将本地仓库索引的机器/路径信息共享，不保存认证或设备当前身份配置。
