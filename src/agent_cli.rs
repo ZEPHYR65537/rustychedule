@@ -777,7 +777,7 @@ fn render_tree(
             "{prefix}{} {} [{label}] #{}\n",
             if last { "└──" } else { "├──" },
             n.name,
-            &n.id
+            n.id
         ));
         if n.kind != NodeKind::Repository {
             let path = hub.join("content").join(&n.id);
