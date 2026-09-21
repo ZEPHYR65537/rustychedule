@@ -1,3 +1,5 @@
+use crate::ledger::{Funding, FundingPolicy, ModelAccount, WorkSession};
+use crate::workspace::Project;
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use clap::ValueEnum;
@@ -140,18 +142,7 @@ pub struct Model {
     pub provider: String,
     pub capability: u8,
     pub enabled: bool,
-    pub input_price: f64,
-    pub output_price: f64,
-    pub cached_price: f64,
     pub bindings: Vec<Binding>,
-}
-impl Model {
-    pub fn cost(&self, input: u64, output: u64, cached: u64) -> f64 {
-        ((input - cached) as f64 * self.input_price
-            + output as f64 * self.output_price
-            + cached as f64 * self.cached_price)
-            / 1_000_000.0
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -159,6 +150,8 @@ pub struct Budget {
     pub id: u64,
     pub task: u64,
     pub model: String,
+    #[serde(default)]
+    pub funding: Funding,
     pub input: u64,
     pub output: u64,
     pub created: Time,
@@ -187,6 +180,11 @@ pub struct Event {
     pub at: Time,
     pub note: String,
     pub voided: bool,
+    #[serde(default)]
+    pub funding: Funding,
+    /// Original supplier observation; not an exact token measurement.
+    #[serde(default)]
+    pub observed_percent: Option<f64>,
     #[serde(flatten)]
     pub kind: EventKind,
 }
@@ -199,7 +197,6 @@ pub enum EventKind {
         input: u64,
         output: u64,
         cached: u64,
-        cost: f64,
         units: BTreeMap<String, f64>,
     },
     Snapshot {
@@ -218,26 +215,39 @@ pub enum EventKind {
 pub struct State {
     pub version: u32,
     pub next_id: u64,
-    pub currency: String,
     pub tasks: Vec<Task>,
     pub models: Vec<Model>,
     pub pools: Vec<Pool>,
     pub budgets: Vec<Budget>,
     pub credits: Vec<Credit>,
     pub events: Vec<Event>,
+    #[serde(default, alias = "billing")]
+    pub accounts: BTreeMap<String, ModelAccount>,
+    #[serde(default)]
+    pub model_preferences: Vec<[String; 2]>,
+    #[serde(default)]
+    pub funding_policy: FundingPolicy,
+    #[serde(default)]
+    pub sessions: Vec<WorkSession>,
+    #[serde(default)]
+    pub projects: Vec<Project>,
 }
 impl Default for State {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             next_id: 1,
-            currency: "CNY".into(),
             tasks: vec![],
             models: vec![],
             pools: vec![],
             budgets: vec![],
             credits: vec![],
             events: vec![],
+            accounts: BTreeMap::new(),
+            model_preferences: vec![],
+            funding_policy: FundingPolicy::default(),
+            sessions: vec![],
+            projects: vec![],
         }
     }
 }
@@ -254,6 +264,8 @@ pub struct QuotaView {
     pub available: f64,
     pub next_reset: Option<Time>,
     pub approximate: bool,
+    pub funding: Funding,
+    pub observed_percent: Option<f64>,
 }
 
 impl State {
@@ -298,7 +310,7 @@ impl State {
                 ..
             } = &e.kind
             {
-                if *task == b.task && *model == b.model {
+                if *task == b.task && *model == b.model && e.funding == b.funding {
                     input = input.saturating_add(*i);
                     output = output.saturating_add(*o);
                 }
@@ -309,30 +321,28 @@ impl State {
             b.output.saturating_sub(output),
         )
     }
-    pub fn task_usage(&self, id: u64, now: Time) -> (u64, u64, f64) {
-        let (mut i, mut o, mut cost) = (0u64, 0u64, 0.0);
+    pub fn task_usage(&self, id: u64, now: Time) -> (u64, u64) {
+        let (mut i, mut o) = (0u64, 0u64);
         for e in self.events.iter().filter(|e| !e.voided && e.at <= now) {
             if let EventKind::Usage {
                 task: Some(t),
                 input,
                 output,
-                cost: c,
                 ..
             } = &e.kind
             {
                 if *t == id {
                     i = i.saturating_add(*input);
                     o = o.saturating_add(*output);
-                    cost += c;
                 }
             }
         }
-        (i, o, cost)
+        (i, o)
     }
     pub fn reserved(&self, pool: &str, now: Time, exclude: Option<u64>) -> f64 {
         self.budgets
             .iter()
-            .filter(|b| Some(b.task) != exclude)
+            .filter(|b| Some(b.task) != exclude && b.funding == Funding::Subscription)
             .map(|b| {
                 let (i, o) = self.remaining_budget(b, now);
                 self.model(&b.model)
@@ -365,7 +375,11 @@ impl State {
                     pool: p,
                     window,
                     used,
-                } if p == &pool.name && window == &w.name => Some((e, *used)),
+                } if p == &pool.name && window == &w.name => Some((
+                    e,
+                    e.observed_percent
+                        .map_or(*used, |percent| w.limit * percent / 100.0),
+                )),
                 EventKind::Reset { targets, .. }
                     if targets
                         .get(&pool.name)
@@ -377,7 +391,11 @@ impl State {
             })
             .max_by_key(|(e, _)| (e.at, e.id));
         let mut used = baseline.map_or(0.0, |(_, v)| v);
-        let approximate = w.kind == WindowKind::Rolling && baseline.is_some_and(|(_, v)| v > 0.0);
+        let approximate = (w.kind == WindowKind::Rolling && baseline.is_some_and(|(_, v)| v > 0.0))
+            || self
+                .accounts
+                .get(&pool.name)
+                .is_some_and(|b| b.subscription.is_some());
         if w.kind == WindowKind::Rolling {
             next = baseline
                 .filter(|(_, v)| *v > 0.0)
@@ -395,6 +413,9 @@ impl State {
                 continue;
             }
             if let EventKind::Usage { units, .. } = &e.kind {
+                if e.funding == Funding::Api {
+                    continue;
+                }
                 used += units.get(&pool.name).copied().unwrap_or(0.0);
                 if w.kind == WindowKind::Rolling && units.get(&pool.name).is_some_and(|x| *x > 0.0)
                 {
@@ -415,13 +436,24 @@ impl State {
             available: (w.limit - used - reserved).max(0.0),
             next_reset: next,
             approximate,
+            funding: Funding::Subscription,
+            observed_percent: baseline.and_then(|(e, _)| e.observed_percent),
         }
     }
     pub fn quotas(&self, now: Time) -> Vec<QuotaView> {
-        self.pools
+        let mut quotas: Vec<_> = self
+            .pools
             .iter()
             .flat_map(|p| p.windows.iter().map(move |w| self.quota(p, w, now, None)))
-            .collect()
+            .collect();
+        for model in self.models.iter().filter(|m| {
+            self.accounts
+                .get(&m.name)
+                .is_some_and(|b| b.api_token_limit > 0)
+        }) {
+            quotas.push(self.api_quota(&model.name, now));
+        }
+        quotas
     }
     pub fn budget_set(
         &mut self,
@@ -432,6 +464,25 @@ impl State {
         now: Time,
         force: bool,
     ) -> Result<u64> {
+        self.budget_set_funded(
+            task,
+            model,
+            (input, output),
+            Funding::Subscription,
+            now,
+            force,
+        )
+    }
+    pub fn budget_set_funded(
+        &mut self,
+        task: u64,
+        model: &str,
+        amount: (u64, u64),
+        funding: Funding,
+        now: Time,
+        force: bool,
+    ) -> Result<u64> {
+        let (input, output) = amount;
         ensure!(self.task(task)?.status.active(), "任务已结束，请先重新打开");
         tokens(input, output)?;
         let m = self.model(model)?;
@@ -446,33 +497,52 @@ impl State {
             "该模型不在任务允许的模型列表中"
         );
         // Replace only this task/model budget; retain other models' reservations.
-        for binding in &m.bindings {
-            let p = self.pool(&binding.pool)?;
+        if funding == Funding::Api {
+            let q = self.api_quota(model, now);
             let old: f64 = self
                 .budgets
                 .iter()
-                .filter(|b| b.task == task && b.model == model)
+                .filter(|b| b.task == task && b.model == model && b.funding == funding)
                 .map(|b| {
                     let (i, o) = self.remaining_budget(b, now);
-                    binding.units(i, o)
+                    i as f64 + o as f64
                 })
                 .sum();
-            for w in &p.windows {
-                let q = self.quota(p, w, now, None);
-                ensure!(
-                    force
-                        || q.used + q.reserved - old + binding.units(input, output)
-                            <= q.limit + 1e-8,
-                    "额度不足：{}/{}；可用 {:.2}，申请 {:.2}。可减少预算或使用 --force 记录超配",
-                    p.name,
-                    w.name,
-                    (q.limit - q.used - q.reserved + old).max(0.0),
-                    binding.units(input, output)
-                );
+            ensure!(q.limit > 0.0, "尚未配置该模型的 API token 上界");
+            ensure!(
+                force || q.used + q.reserved - old + input as f64 + output as f64 <= q.limit + 1e-8,
+                "API token 余额不足"
+            );
+        } else {
+            ensure!(self.subscription_enabled(model), "该模型没有启用的订阅");
+            for binding in &m.bindings {
+                let p = self.pool(&binding.pool)?;
+                let old: f64 = self
+                    .budgets
+                    .iter()
+                    .filter(|b| b.task == task && b.model == model && b.funding == funding)
+                    .map(|b| {
+                        let (i, o) = self.remaining_budget(b, now);
+                        binding.units(i, o)
+                    })
+                    .sum();
+                for w in &p.windows {
+                    let q = self.quota(p, w, now, None);
+                    ensure!(
+                        force
+                            || q.used + q.reserved - old + binding.units(input, output)
+                                <= q.limit + 1e-8,
+                        "额度不足：{}/{}；可用 {:.2}，申请 {:.2}。可减少预算或使用 --force 记录超配",
+                        p.name,
+                        w.name,
+                        (q.limit - q.used - q.reserved + old).max(0.0),
+                        binding.units(input, output)
+                    );
+                }
             }
         }
         for b in &mut self.budgets {
-            if b.task == task && b.model == model {
+            if b.task == task && b.model == model && b.funding == funding {
                 b.released = true;
             }
         }
@@ -481,6 +551,7 @@ impl State {
             id,
             task,
             model: model.into(),
+            funding,
             input,
             output,
             created: now,
@@ -554,6 +625,8 @@ impl State {
             at: now,
             note,
             voided: false,
+            funding: Default::default(),
+            observed_percent: None,
             kind: EventKind::Reset {
                 targets,
                 source,
@@ -563,12 +636,11 @@ impl State {
         Ok(id)
     }
     pub fn validate(&self) -> Result<()> {
-        ensure!(self.version == 1, "不支持的数据版本 {}", self.version);
+        ensure!(self.version == 2, "不支持的数据版本 {}", self.version);
         ensure!(
             self.next_id > 0 && self.next_id < u64::MAX - 1,
             "数据编号空间已耗尽"
         );
-        ensure!(!self.currency.trim().is_empty(), "货币单位不能为空");
         let mut ids = BTreeSet::new();
         for id in self
             .tasks
@@ -577,6 +649,7 @@ impl State {
             .chain(self.budgets.iter().map(|x| x.id))
             .chain(self.credits.iter().map(|x| x.id))
             .chain(self.events.iter().map(|x| x.id))
+            .chain(self.sessions.iter().map(|x| x.id))
         {
             ensure!(
                 id > 0 && id < self.next_id && ids.insert(id),
@@ -605,9 +678,6 @@ impl State {
             name(&m.name)?;
             ensure!(names.insert(&m.name), "模型重名");
             level(m.capability)?;
-            for p in [m.input_price, m.output_price, m.cached_price] {
-                nonnegative(p)?;
-            }
             let mut bound = BTreeSet::new();
             ensure!(
                 m.bindings.len() == 1 && m.bindings[0].pool == m.name,
@@ -671,7 +741,7 @@ impl State {
             self.model(&b.model)?;
             tokens(b.input, b.output)?;
             ensure!(
-                b.released || active.insert((b.task, &b.model)),
+                b.released || active.insert((b.task, &b.model, b.funding)),
                 "任务/模型有重复的有效预算"
             );
         }
@@ -690,6 +760,18 @@ impl State {
             }
         }
         for e in &self.events {
+            if let Some(p) = e.observed_percent {
+                ensure!(
+                    p.is_finite()
+                        && (0.0..=100.0).contains(&p)
+                        && matches!(e.kind, EventKind::Snapshot { .. }),
+                    "百分比观测无效"
+                );
+            }
+            ensure!(
+                e.funding != Funding::Api || matches!(e.kind, EventKind::Usage { .. }),
+                "API 来源只能用于用量记录"
+            );
             match &e.kind {
                 EventKind::Usage {
                     task,
@@ -697,7 +779,6 @@ impl State {
                     input,
                     output,
                     cached,
-                    cost,
                     units,
                 } => {
                     if let Some(t) = task {
@@ -706,7 +787,6 @@ impl State {
                     self.model(model)?;
                     tokens(*input, *output)?;
                     ensure!(cached <= input, "缓存 token 大于输入 token");
-                    nonnegative(*cost)?;
                     for (p, u) in units {
                         self.pool(p)?;
                         nonnegative(*u)?;
@@ -743,6 +823,8 @@ impl State {
                 }
             }
         }
+        self.validate_ledger()?;
+        crate::workspace::validate_projects(&self.projects)?;
         Ok(())
     }
     fn visit(&self, id: u64, done: &mut BTreeSet<u64>, stack: &mut BTreeSet<u64>) -> Result<()> {

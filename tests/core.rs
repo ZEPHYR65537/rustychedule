@@ -1,25 +1,22 @@
 use chrono::Duration;
+use schedule::{domain::*, planner, store::Store};
 use std::collections::BTreeMap;
-use tongchou::{domain::*, planner, store::Store};
 
 fn now() -> Time {
     parse_time("2026-09-21T10:00:00+08:00", false).unwrap()
 }
 fn state() -> State {
     let mut s = State::default();
-    for (name, cap, limit, price) in [
-        ("strong", 5, 1000.0, 10.0),
-        ("fast", 3, 2000.0, 1.0),
-        ("local", 1, 5000.0, 0.0),
+    for (name, cap, limit) in [
+        ("strong", 5, 1000.0),
+        ("fast", 3, 2000.0),
+        ("local", 1, 5000.0),
     ] {
         s.models.push(Model {
             name: name.into(),
             provider: "test".into(),
             capability: cap,
             enabled: true,
-            input_price: price,
-            output_price: price * 2.0,
-            cached_price: 0.0,
             bindings: vec![Binding {
                 pool: name.into(),
                 input_weight: 1.0,
@@ -76,13 +73,14 @@ fn log(s: &mut State, model: &str, task: Option<u64>, i: u64, o: u64, at: Time) 
         at,
         note: String::new(),
         voided: false,
+        funding: Default::default(),
+        observed_percent: None,
         kind: EventKind::Usage {
             task,
             model: model.into(),
             input: i,
             output: o,
             cached: 0,
-            cost: 0.0,
             units: BTreeMap::from([(model.into(), (i + o) as f64)]),
         },
     });
@@ -95,6 +93,8 @@ fn snapshot(s: &mut State, model: &str, window: &str, used: f64, at: Time) {
         at,
         note: String::new(),
         voided: false,
+        funding: Default::default(),
+        observed_percent: None,
         kind: EventKind::Snapshot {
             pool: model.into(),
             window: window.into(),
@@ -382,7 +382,7 @@ fn unsplittable_skips_partial_strong_and_uses_whole_fast() {
     assert_eq!(p.items[0].assignments[0].model, "fast");
 }
 #[test]
-fn incomparable_models_tie_break_on_cost_not_invented_preference() {
+fn incomparable_models_tie_break_on_tokens_not_invented_preference() {
     let mut s = state();
     task(&mut s, 100, 0);
     s.tasks[0].preferences = vec![["strong".into(), "fast".into()]];
@@ -535,9 +535,9 @@ fn void_usage_restores_budget_but_does_not_undo_progress() {
 #[test]
 fn invalid_values_and_orphan_data_rejected() {
     let mut s = state();
-    s.models[0].input_price = f64::NAN;
+    s.models[0].bindings[0].input_weight = f64::NAN;
     assert!(s.validate().is_err());
-    s.models[0].input_price = 0.0;
+    s.models[0].bindings[0].input_weight = 1.0;
     task(&mut s, 100, 0);
     s.tasks[0].progress = 101.0;
     assert!(s.validate().is_err());
@@ -568,12 +568,7 @@ fn atomic_persistence_backup_lock_and_corruption_detection() {
     drop(store);
     assert!(Store::open(dir.path().into()).is_ok());
 }
-#[test]
-fn model_cost_cached_input_is_subset() {
-    let s = state();
-    let m = &s.models[0];
-    assert_eq!(m.cost(1000, 100, 500), 0.007);
-}
+
 #[test]
 fn duration_and_timezone_parser() {
     assert_eq!(parse_duration("5h").unwrap(), 18000);

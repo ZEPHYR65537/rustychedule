@@ -1,4 +1,5 @@
 use crate::domain::*;
+use crate::ledger::{Funding, FundingPolicy};
 use anyhow::{Result, ensure};
 use chrono::Duration;
 use serde::Serialize;
@@ -7,10 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Debug, Serialize)]
 pub struct Assignment {
     pub model: String,
+    pub funding: Funding,
     pub input: u64,
     pub output: u64,
     pub existing: bool,
-    pub estimated_cost: f64,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct PlanItem {
@@ -88,7 +89,7 @@ pub fn build(
             .then(a.id.cmp(&b.id))
     });
     // Available units include reservations for ALL active tasks, even outside this plan.
-    let mut free: BTreeMap<String, f64> = state
+    let mut free: BTreeMap<(String, Funding), f64> = state
         .pools
         .iter()
         .map(|p| {
@@ -100,9 +101,23 @@ pub fn build(
                     (q.limit * (1.0 - reserve_percent / 100.0) - q.used - q.reserved).max(0.0)
                 })
                 .fold(f64::INFINITY, f64::min);
-            (p.name.clone(), available)
+            (
+                (p.name.clone(), Funding::Subscription),
+                if state.subscription_enabled(&p.name) {
+                    available
+                } else {
+                    0.0
+                },
+            )
         })
         .collect();
+    for model in &state.models {
+        let q = state.api_quota(&model.name, now);
+        free.insert(
+            (model.name.clone(), Funding::Api),
+            (q.limit * (1.0 - reserve_percent / 100.0) - q.used - q.reserved).max(0.0),
+        );
+    }
     let mut plan = Plan {
         at: now,
         minutes,
@@ -112,7 +127,7 @@ pub fn build(
         deferred: vec![],
         notes: vec![
             "只使用当前已存在的额度；不预支自然重置、随机 Tibo 刷新或未兑换 reset 卡。".into(),
-            "计划为可解释的优先级贪心排程；分钟数是本次剩余工作量，费用使用手填价格估算。".into(),
+            "计划为可解释的优先级贪心排程；分钟数是本次剩余工作量，只管理用量，不管理费用。".into(),
         ],
     };
     let mut scheduled = BTreeSet::new();
@@ -127,6 +142,7 @@ pub fn build(
             break;
         };
         let t = pending.remove(index);
+        let preferences = state.preferences_for(t);
         let defer = |plan: &mut Plan, reason: String| {
             plan.deferred.push(Deferred {
                 task: t.id,
@@ -171,12 +187,25 @@ pub fn build(
                 ));
                 break;
             }
-            for binding in &m.bindings {
-                let p = state.pool(&binding.pool)?;
-                for w in &p.windows {
-                    let q = state.quota(p, w, now, None);
-                    if q.used + q.reserved > q.limit + 1e-8 {
-                        bad = Some(format!("{}/{} 已超配，请先调整现有预算", p.name, w.name));
+            if b.funding == Funding::Api {
+                let q = state.api_quota(&m.name, now);
+                if q.used + q.reserved > q.limit + 1e-8 {
+                    bad = Some(format!("{}/API 已超配，请 --rebalance 重规划", m.name));
+                }
+                if state.funding_policy == FundingPolicy::SubscriptionOnly {
+                    bad = Some("策略不允许 API，但已有 API 预留；请 --rebalance".into());
+                }
+            } else {
+                if !state.subscription_enabled(&m.name) {
+                    bad = Some("已有订阅预留，但订阅已停用；请 --rebalance".into());
+                }
+                for binding in &m.bindings {
+                    let p = state.pool(&binding.pool)?;
+                    for w in &p.windows {
+                        let q = state.quota(p, w, now, None);
+                        if q.used + q.reserved > q.limit + 1e-8 {
+                            bad = Some(format!("{}/{} 已超配，请先调整现有预算", p.name, w.name));
+                        }
                     }
                 }
             }
@@ -185,10 +214,10 @@ pub fn build(
             reserved_o += o as f64 / factor;
             assignments.push(Assignment {
                 model: m.name.clone(),
+                funding: b.funding,
                 input: i,
                 output: o,
                 existing: true,
-                estimated_cost: m.cost(i, o, 0),
             });
         }
         if let Some(reason) = bad {
@@ -221,8 +250,7 @@ pub fn build(
                 .models
                 .iter()
                 .filter(|m| {
-                    !attempted.contains(&m.name)
-                        && m.enabled
+                    m.enabled
                         && m.capability >= t.capability
                         && (t.allowed_models.is_empty() || t.allowed_models.contains(&m.name))
                         && (t.splittable || assignments.first().is_none_or(|a| a.model == m.name))
@@ -231,47 +259,90 @@ pub fn build(
             candidates.sort_by(|a, b| {
                 let ai = t.factors.get(&a.name).copied().unwrap_or(1.0);
                 let bi = t.factors.get(&b.name).copied().unwrap_or(1.0);
-                a.cost(
-                    (extra_i * ai).ceil() as u64,
-                    (extra_o * ai).ceil() as u64,
-                    0,
-                )
-                .total_cmp(&b.cost(
-                    (extra_i * bi).ceil() as u64,
-                    (extra_o * bi).ceil() as u64,
-                    0,
-                ))
-                .then(a.capability.cmp(&b.capability))
-                .then(a.name.cmp(&b.name))
+                ((extra_i + extra_o) * ai)
+                    .total_cmp(&((extra_i + extra_o) * bi))
+                    .then(a.capability.cmp(&b.capability))
+                    .then(a.name.cmp(&b.name))
             });
-            let feasible: Vec<_> = candidates
+            let mut feasible: Vec<_> = candidates
                 .iter()
-                .filter_map(|m| {
+                .flat_map(|m| {
                     let factor = t.factors.get(&m.name).copied().unwrap_or(1.0);
-                    let fraction =
-                        fit_fraction(m, extra_i * factor, extra_o * factor, &trial, t.splittable);
-                    (fraction > 1e-12).then_some((*m, fraction, factor))
+                    if !t.splittable
+                        && !can_cover(
+                            m,
+                            extra_i * factor,
+                            extra_o * factor,
+                            &trial,
+                            &attempted,
+                            state.funding_policy,
+                        )
+                    {
+                        return vec![];
+                    }
+                    [Funding::Subscription, Funding::Api]
+                        .into_iter()
+                        .filter_map(|source| {
+                            if attempted.contains(&(m.name.clone(), source))
+                                || (source == Funding::Api
+                                    && state.funding_policy == FundingPolicy::SubscriptionOnly)
+                            {
+                                return None;
+                            }
+                            let fraction = fit_fraction(
+                                m,
+                                source,
+                                extra_i * factor,
+                                extra_o * factor,
+                                &trial,
+                                true,
+                            );
+                            (fraction > 1e-12).then_some((*m, source, fraction, factor))
+                        })
+                        .collect::<Vec<_>>()
                 })
                 .collect();
+            if state.funding_policy == FundingPolicy::SubscriptionFirst
+                && feasible
+                    .iter()
+                    .any(|(_, s, _, _)| *s == Funding::Subscription)
+            {
+                feasible.retain(|(_, s, _, _)| *s == Funding::Subscription);
+            }
+            feasible.sort_by(|(a, sa, _, fa), (b, sb, _, fb)| {
+                let ca = (extra_i + extra_o) * fa;
+                let cb = (extra_i + extra_o) * fb;
+                if a.name == b.name {
+                    sa.cmp(sb)
+                } else {
+                    ca.total_cmp(&cb)
+                        .then(a.capability.cmp(&b.capability))
+                        .then(a.name.cmp(&b.name))
+                }
+            });
             let maximal: Vec<_> = feasible
                 .iter()
-                .filter(|(m, _, _)| {
+                .filter(|(m, _, _, _)| {
                     !feasible
                         .iter()
-                        .any(|(other, _, _)| prefers(&t.preferences, &other.name, &m.name))
+                        .any(|(other, _, _, _)| prefers(preferences, &other.name, &m.name))
                 })
                 .collect();
-            if let Some((m, fraction, factor)) = maximal.first().copied() {
-                if maximal.len() > 1 {
+            if let Some((m, source, fraction, factor)) = maximal.first().copied() {
+                let incomparable = maximal
+                    .iter()
+                    .map(|(m, _, _, _)| &m.name)
+                    .collect::<BTreeSet<_>>()
+                    .len();
+                if incomparable > 1 {
                     preference_notes.push(format!(
-                        "{} 个可用模型互不可比，按成本、能力等级、名称选择 {}",
-                        maximal.len(),
-                        m.name
+                        "{} 个可用模型互不可比，按预计 token、能力等级、名称选择 {}",
+                        incomparable, m.name
                     ));
                 }
                 if state.models.iter().any(|other| {
-                    prefers(&t.preferences, &other.name, &m.name)
-                        && !feasible.iter().any(|(f, _, _)| f.name == other.name)
+                    prefers(preferences, &other.name, &m.name)
+                        && !feasible.iter().any(|(f, _, _, _)| f.name == other.name)
                 }) {
                     preference_notes.push(format!(
                         "更偏好的模型不可用/额度已用尽，降级选择 {}",
@@ -282,19 +353,21 @@ pub fn build(
                     (extra_i * factor * fraction).ceil() as u64,
                     (extra_o * factor * fraction).ceil() as u64,
                 );
-                for b in &m.bindings {
-                    *trial.get_mut(&b.pool).unwrap() -= b.units(i, o);
+                *trial.get_mut(&(m.name.clone(), *source)).unwrap() -=
+                    state.funding_units(&m.name, *source, i, o);
+                if *source == Funding::Api {
+                    preference_notes.push(format!("{} 使用 API 补充额度：{} token", m.name, i + o));
                 }
                 assignments.push(Assignment {
                     model: m.name.clone(),
+                    funding: *source,
                     input: i,
                     output: o,
                     existing: false,
-                    estimated_cost: m.cost(i, o, 0),
                 });
                 extra_i = (extra_i - i as f64 / factor).max(0.0);
                 extra_o = (extra_o - o as f64 / factor).max(0.0);
-                attempted.insert(m.name.clone());
+                attempted.insert((m.name.clone(), *source));
             } else {
                 break;
             }
@@ -325,7 +398,7 @@ pub fn build(
         }
         for a in &assignments {
             let p = state.pool(&a.model)?;
-            if p.windows.is_empty() {
+            if p.windows.is_empty() && a.funding == Funding::Subscription {
                 warnings.push(format!("{} 未设置限额，按不受限处理", a.model));
             }
         }
@@ -366,11 +439,42 @@ pub fn build(
     Ok(plan)
 }
 /// Largest proportional segment fitting integer token charges; rounding never exceeds quota.
-fn fit_fraction(m: &Model, i: f64, o: f64, free: &BTreeMap<String, f64>, split: bool) -> f64 {
+fn can_cover(
+    m: &Model,
+    mut i: f64,
+    mut o: f64,
+    free: &BTreeMap<(String, Funding), f64>,
+    attempted: &BTreeSet<(String, Funding)>,
+    policy: FundingPolicy,
+) -> bool {
+    for source in [Funding::Subscription, Funding::Api] {
+        if attempted.contains(&(m.name.clone(), source))
+            || (source == Funding::Api && policy == FundingPolicy::SubscriptionOnly)
+        {
+            continue;
+        }
+        let f = fit_fraction(m, source, i, o, free, true);
+        i = (i - (i * f).ceil()).max(0.0);
+        o = (o - (o * f).ceil()).max(0.0);
+    }
+    i <= 1e-7 && o <= 1e-7
+}
+fn fit_fraction(
+    m: &Model,
+    source: Funding,
+    i: f64,
+    o: f64,
+    free: &BTreeMap<(String, Funding), f64>,
+    split: bool,
+) -> f64 {
     let fits = |f: f64| {
-        m.bindings
-            .iter()
-            .all(|b| b.units((i * f).ceil() as u64, (o * f).ceil() as u64) <= free[&b.pool])
+        let (i, o) = ((i * f).ceil() as u64, (o * f).ceil() as u64);
+        let amount = if source == Funding::Api {
+            i as f64 + o as f64
+        } else {
+            m.bindings[0].units(i, o)
+        };
+        amount <= free[&(m.name.clone(), source)]
     };
     if fits(1.0) {
         return 1.0;
@@ -408,16 +512,16 @@ pub fn commit(state: &mut State, plan: &Plan) -> Result<()> {
             let (old_i, old_o) = state
                 .budgets
                 .iter()
-                .filter(|b| b.task == item.task && b.model == a.model)
+                .filter(|b| b.task == item.task && b.model == a.model && b.funding == a.funding)
                 .map(|b| state.remaining_budget(b, plan.at))
                 .fold((0u64, 0u64), |(i, o), (bi, bo)| {
                     (i.saturating_add(bi), o.saturating_add(bo))
                 });
-            state.budget_set(
+            state.budget_set_funded(
                 item.task,
                 &a.model,
-                old_i + a.input,
-                old_o + a.output,
+                (old_i + a.input, old_o + a.output),
+                a.funding,
                 plan.at,
                 false,
             )?;

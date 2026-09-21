@@ -1,3 +1,4 @@
+use crate::ledger::Funding;
 use crate::{domain::*, planner::Plan};
 use chrono::{Duration, Local};
 use serde_json::{Value, json};
@@ -85,6 +86,9 @@ pub fn number(x: f64) -> String {
     }
 }
 fn bar(used: f64, reserved: f64, limit: f64) -> String {
+    if limit <= 0.0 {
+        return "[ 上限为0 ]".into();
+    }
     let used_n = ((used / limit).clamp(0.0, 1.0) * 18.0).round() as usize;
     let reserve_n = (((reserved / limit).clamp(0.0, 1.0) * 18.0).round() as usize).min(18 - used_n);
     format!(
@@ -135,7 +139,7 @@ pub fn quota_table(quotas: &[QuotaView], now: Time) -> String {
         &[
             "模型/窗口",
             "用量 / 预留",
-            "已用%",
+            "已用% / 面板观测",
             "已用+预留 / 限额",
             "可分配",
             "自然重置/释放",
@@ -147,23 +151,33 @@ pub fn quota_table(quotas: &[QuotaView], now: Time) -> String {
                     .next_reset
                     .map(|t| format!("{} ({}m)", fmt_time(t), (t - now).num_minutes().max(0)))
                     .unwrap_or_else(|| {
-                        if q.kind == WindowKind::Rolling {
+                        if q.funding == crate::ledger::Funding::Api {
+                            "累计上限，不自动重置".into()
+                        } else if q.kind == WindowKind::Rolling {
                             "滚动窗口（暂无用量）".into()
                         } else {
                             "仅手动重置".into()
                         }
                     });
                 vec![
-                    format!("{}/{}", q.pool, q.window),
+                    format!("{}/{}/{}", q.pool, q.funding.label(), q.window),
                     bar(q.used, q.reserved, q.limit),
                     format!(
-                        "{:.0}%{}",
-                        q.used / q.limit * 100.0,
+                        "{}{:.0}%{}{}",
+                        if q.approximate { "~" } else { "" },
+                        if q.limit > 0.0 && q.used > 0.0 {
+                            q.used / q.limit * 100.0
+                        } else {
+                            0.0
+                        },
                         if q.used + q.reserved > q.limit {
                             "!"
                         } else {
                             ""
-                        }
+                        },
+                        q.observed_percent
+                            .map(|p| format!(" / {p:.0}%"))
+                            .unwrap_or_default()
                     ),
                     format!(
                         "{}+{} / {} {}",
@@ -173,7 +187,7 @@ pub fn quota_table(quotas: &[QuotaView], now: Time) -> String {
                         q.unit
                     ),
                     number(q.available),
-                    if q.approximate {
+                    if q.approximate && q.kind == WindowKind::Rolling {
                         format!("~{next}")
                     } else {
                         next
@@ -181,9 +195,9 @@ pub fn quota_table(quotas: &[QuotaView], now: Time) -> String {
                 ]
             })
             .collect(),
-        &[24, 20, 7, 34, 10, 24],
+        &[28, 20, 20, 34, 10, 24],
     );
-    out.push_str("█ 已用  ░ 任务预留  · 空闲  ! 已用+预留超限  ~ 滚动快照估计\n每行独立约束；不跨模型加总额度。同模型所有窗口必须同时满足。\n");
+    out.push_str("█ 已用  ░ 任务预留  · 空闲  ! 超限  ~ 估计值\n每模型的订阅与 API 分开记账。订阅窗口须同时满足；API 上限为 0 则不使用。\n");
     out
 }
 pub fn matrix(s: &State, now: Time) -> String {
@@ -238,14 +252,7 @@ pub fn matrix(s: &State, now: Time) -> String {
 }
 pub fn models(s: &State) -> String {
     table(
-        &[
-            "模型",
-            "提供方",
-            "能力",
-            "启用",
-            "输入/输出/缓存价格",
-            "额度折算 I/O",
-        ],
+        &["模型", "提供方", "能力", "启用", "额度折算 I/O"],
         s.models
             .iter()
             .map(|m| {
@@ -254,7 +261,6 @@ pub fn models(s: &State) -> String {
                     m.provider.clone(),
                     m.capability.to_string(),
                     m.enabled.to_string(),
-                    format!("{}/{}/{}", m.input_price, m.output_price, m.cached_price),
                     format!(
                         "{}/{}",
                         m.bindings[0].input_weight, m.bindings[0].output_weight
@@ -262,10 +268,7 @@ pub fn models(s: &State) -> String {
                 ]
             })
             .collect(),
-        &[22, 24, 6, 6, 28, 20],
-    ) + &format!(
-        "价格单位：{} / 百万 token。价格为手填，0 表示当前按 0 估算。\n",
-        s.currency
+        &[22, 24, 6, 6, 20],
     )
 }
 pub fn credits(s: &State, now: Time) -> String {
@@ -321,21 +324,33 @@ pub fn dashboard(s: &State, now: Time) -> String {
         .iter()
         .filter(|t| t.due.is_some_and(|d| d < now))
         .count();
+    let logged_minutes: u64 = s
+        .sessions
+        .iter()
+        .filter(|r| {
+            !r.voided
+                && r.at.with_timezone(&Local).date_naive() == now.with_timezone(&Local).date_naive()
+        })
+        .map(|r| u64::from(r.minutes))
+        .sum();
     format!(
-        "统筹 / Rustychedule  ·  {}\n未结束 {}  ·  逾期 {}  ·  模型 {}\n\n当前优先任务\n{}\n各模型独立额度\n{}\nReset 卡库存\n{}\n常用：matrix | plan --minutes 240 | plan --rebalance --commit | report\n",
+        "Schedule / tc  ·  {}\n未结束 {}  ·  逾期 {}  ·  模型 {} · 今日已记账 {} 分钟 · 项目 {}\n\n当前优先任务\n{}\n订阅信息\n{}\n各模型独立额度\n{}\nReset 卡库存\n{}\n常用：matrix | plan --minutes 240 | work log | project status | hub status\n",
         fmt_time(now),
         tasks.len(),
         overdue,
         s.models.len(),
+        logged_minutes,
+        s.projects.len(),
         task_table(&tasks.into_iter().take(8).collect::<Vec<_>>(), now),
+        crate::commands::accounts_table(s, now),
         quota_table(&s.quotas(now), now),
         credits(s, now)
     )
 }
 pub fn task_detail(s: &State, t: &Task, now: Time) -> String {
-    let (i, o, c) = s.task_usage(t.id, now);
+    let (i, o) = s.task_usage(t.id, now);
     format!(
-        "{}\n项目：{}；标签：{}\n依赖：{:?}\n允许模型：{}\n偏序：{}\n模型倍率：{}；允许分段：{}\n基准 token 估计：输入 {} / 输出 {}；进度 {:.1}%（手动登记）\n累计实际：输入 {} / 输出 {}；费用 {:.4} {}\n备注：{}\n",
+        "{}\n项目：{}；标签：{}\n依赖：{:?}\n允许模型：{}\n有效偏序：{}\n模型倍率：{}；允许分段：{}\n基准 token 估计：输入 {} / 输出 {}；进度 {:.1}%（手动登记）\n累计实际：输入 {} / 输出 {}\n备注：{}\n",
         task_table(&[t], now),
         clean(&t.project),
         clean(&t.tags.join(",")),
@@ -345,7 +360,7 @@ pub fn task_detail(s: &State, t: &Task, now: Time) -> String {
         } else {
             t.allowed_models.join(",")
         },
-        t.preferences
+        s.preferences_for(t)
             .iter()
             .map(|[a, b]| format!("{a} > {b}"))
             .collect::<Vec<_>>()
@@ -357,26 +372,30 @@ pub fn task_detail(s: &State, t: &Task, now: Time) -> String {
         t.progress,
         i,
         o,
-        c,
-        s.currency,
         clean(&t.note)
     )
 }
 pub fn budget_rows(rows: &[Value]) -> String {
     table(
-        &["预算", "任务", "模型", "剩余输入", "剩余输出"],
+        &["预算", "任务", "模型", "来源", "剩余输入", "剩余输出"],
         rows.iter()
             .map(|r| {
                 vec![
                     format!("#{}", r["id"]),
                     format!("#{}", r["task"]),
                     r["model"].as_str().unwrap_or("").into(),
+                    if r["source"] == "api" {
+                        "API"
+                    } else {
+                        "订阅"
+                    }
+                    .into(),
                     r["input"].to_string(),
                     r["output"].to_string(),
                 ]
             })
             .collect(),
-        &[10, 10, 24, 16, 16],
+        &[10, 10, 24, 14, 16, 16],
     )
 }
 pub fn events(events: &[&Event]) -> String {
@@ -391,11 +410,13 @@ pub fn events(events: &[&Event]) -> String {
                         task,
                         input,
                         output,
-                        cost,
                         ..
                     } => (
                         "用量",
-                        format!("{model} task={task:?} I={input} O={output} cost={cost:.4}"),
+                        format!(
+                            "{model}/{} task={task:?} I={input} O={output}",
+                            e.funding.label()
+                        ),
                     ),
                     EventKind::Snapshot { pool, window, used } => {
                         ("校准", format!("{pool}/{window} 已用 {used}"))
@@ -424,7 +445,7 @@ pub fn events(events: &[&Event]) -> String {
         &[10, 12, 6, 70, 24],
     )
 }
-pub fn plan(p: &Plan, currency: &str, committed: bool) -> String {
+pub fn plan(p: &Plan, committed: bool) -> String {
     let mut out = format!(
         "本次计划 · {}/{} 分钟 · 新分配保留 {:.0}% 安全余量 · {}\n",
         p.used_minutes,
@@ -451,12 +472,11 @@ pub fn plan(p: &Plan, currency: &str, committed: bool) -> String {
         }
         for a in &item.assignments {
             out.push_str(&format!(
-                "  → {}  输入 {} / 输出 {} token  ≈ {:.4} {}  {}\n",
+                "  → {} / {}  输入 {} / 输出 {} token  {}\n",
                 clean(&a.model),
+                a.funding.label(),
                 a.input,
                 a.output,
-                a.estimated_cost,
-                currency,
                 if a.existing {
                     "[已有预留]"
                 } else {
@@ -488,15 +508,14 @@ pub fn plan(p: &Plan, currency: &str, committed: bool) -> String {
 pub fn report_data(s: &State, now: Time, days: u32) -> Value {
     let first = now.with_timezone(&Local).date_naive() - Duration::days(i64::from(days) - 1);
     let mut rows = vec![];
-    for m in &s.models {
-        let (mut input, mut output, mut cost, mut count) = (0u64, 0u64, 0.0, 0u64);
-        let mut daily: BTreeMap<String, (u64, u64, f64)> = (0..days)
-            .map(|d| {
-                (
-                    (first + Duration::days(i64::from(d))).to_string(),
-                    (0, 0, 0.0),
-                )
-            })
+    for (m, source) in s
+        .models
+        .iter()
+        .flat_map(|m| [Funding::Subscription, Funding::Api].map(|f| (m, f)))
+    {
+        let (mut input, mut output, mut count) = (0u64, 0u64, 0u64);
+        let mut daily: BTreeMap<String, (u64, u64)> = (0..days)
+            .map(|d| ((first + Duration::days(i64::from(d))).to_string(), (0, 0)))
             .collect();
         for e in s.events.iter().filter(|e| {
             !e.voided && e.at <= now && e.at.with_timezone(&Local).date_naive() >= first
@@ -505,30 +524,27 @@ pub fn report_data(s: &State, now: Time, days: u32) -> Value {
                 model,
                 input: i,
                 output: o,
-                cost: c,
                 ..
             } = &e.kind
             {
-                if model == &m.name {
+                if model == &m.name && e.funding == source {
                     input = input.saturating_add(*i);
                     output = output.saturating_add(*o);
-                    cost += c;
                     count += 1;
                     if let Some(v) =
                         daily.get_mut(&e.at.with_timezone(&Local).date_naive().to_string())
                     {
                         v.0 = v.0.saturating_add(*i);
                         v.1 = v.1.saturating_add(*o);
-                        v.2 += c;
                     }
                 }
             }
         }
-        rows.push(json!({"model":m.name,"input":input,"output":output,"cost":cost,"records":count,"daily":daily}));
+        rows.push(json!({"model":m.name,"source":source,"input":input,"output":output,"records":count,"daily":daily}));
     }
-    json!({"from":first.to_string(),"to":now.with_timezone(&Local).date_naive().to_string(),"days":days,"currency":s.currency,"models":rows})
+    json!({"from":first.to_string(),"to":now.with_timezone(&Local).date_naive().to_string(),"days":days,"models":rows})
 }
-pub fn report(value: &Value, currency: &str) -> String {
+pub fn report(value: &Value) -> String {
     let rows = value["models"].as_array().unwrap();
     let mut out = format!(
         "{} 至 {} · 按本地日历日统计\n",
@@ -536,19 +552,19 @@ pub fn report(value: &Value, currency: &str) -> String {
         value["to"].as_str().unwrap()
     );
     out.push_str(&table(
-        &["模型", "输入 token", "输出 token", "记录数", "费用"],
+        &["模型", "来源", "输入 token", "输出 token", "记录数"],
         rows.iter()
             .map(|r| {
                 vec![
                     r["model"].as_str().unwrap().into(),
+                    r["source"].as_str().unwrap().into(),
                     r["input"].to_string(),
                     r["output"].to_string(),
                     r["records"].to_string(),
-                    format!("{:.4} {currency}", r["cost"].as_f64().unwrap()),
                 ]
             })
             .collect(),
-        &[24, 16, 16, 8, 22],
+        &[24, 14, 16, 16, 8],
     ));
     let blocks = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     for r in rows {
@@ -575,7 +591,14 @@ pub fn report(value: &Value, currency: &str) -> String {
             .collect();
         out.push_str(&format!(
             "{}  {}  日 token 趋势（各模型独立尺度，最多显示最近 60 天）\n",
-            fit(r["model"].as_str().unwrap(), 20),
+            fit(
+                &format!(
+                    "{}/{}",
+                    r["model"].as_str().unwrap(),
+                    r["source"].as_str().unwrap()
+                ),
+                30
+            ),
             spark
         ));
     }

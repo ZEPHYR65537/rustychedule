@@ -1,207 +1,138 @@
-# Rustychedule · 统筹
+# Rustychedule · Schedule
 
-一个用 Rust 编写的离线任务管理 CLI。命令名为 **`tongchou`**。
+Rust 编写的任务与多模型用量管理 CLI。主命令 **schedule**，短命令 **tc**；两者完全等价。当前版本 **0.2.0**。
 
-同时回答三个问题：**现在先做什么？把剩余工作交给哪个模型？各模型还剩多少可以分配的额度？**
+按重要性、紧迫性、截止时间和依赖安排任务；按用户指定的模型偏序分配工作。每个模型分别维护订阅额度、API token 上限、已用量和任务预留。只管理用量，不记录金额、单价或费用，也不调用模型或替用户购买额度。
 
-每个模型有自己的额度，绝不把不同模型的余额相加。任务可以声明模型偏序；高优先级任务先分配偏好的模型，额度不足时分段降级。任务进度与 token 消耗独立记录。工具不会调用模型 API，也不会实际兑换服务商的重置卡。
+## 安装与体验
 
-## 安装与快速体验
+需要 Rust 1.85+。项目同步另需 Git，并提前配置 Git 的 HTTPS 凭据或 SSH 认证。
 
-需要 Rust 1.85+；本次在 Windows / Rust 1.94 上构建和测试。CI 同时配置 Windows、Linux、macOS。
-
-```sh
+~~~sh
 git clone https://github.com/ZEPHYR65537/rustychedule.git
 cd rustychedule
 cargo install --path . --locked
 
-# 用独立目录体验；所有示例价格和额度都是虚构的
-tongchou --data .demo init --demo
-tongchou --data .demo
-tongchou --data .demo matrix
-tongchou --data .demo plan --minutes 240
-tongchou --data .demo plan --minutes 240 --commit
-tongchou --data .demo report
-```
+tc --data .demo init --demo
+tc --data .demo
+tc --data .demo matrix
+tc --data .demo plan --minutes 240
+~~~
 
-也可以不安装，直接 `cargo run -- --help`；编译好的 Windows 程序在 `target/release/tongchou.exe`。Windows Terminal 等支持 UTF-8 的终端显示最佳；用 `--json` 可获取完整、未经表格截断的内容。
+也可以使用 cargo run -- --help。旧命令 tongchou 保留兼容；Windows、Linux、macOS 均配置持续集成。UTF-8 终端显示中文表格最佳；任何命令加 --json 可取得完整机器可读数据。
 
-## 核心能力
+## 十分钟建立自己的计划
 
-| 需求 | 实现 |
+下面的模型名、能力和数字仅为用户配置示例，不代表任何厂商套餐或官方模型排名。
+
+~~~sh
+tc init
+tc model add strong --capability 5
+tc model add fast --capability 3
+tc subscription set strong --weekly-tokens 1000000 --renewal-day 15
+tc subscription set fast --weekly-tokens 500000
+tc api set strong --limit 50000
+tc api set fast --limit 0
+tc policy models --prefer 'strong>fast'
+tc policy funding model-first
+
+tc task add "完成项目方案" -i 5 -u 4 --minutes 90 --input 40000 --output 10000 --factor fast=1.5
+tc plan --minutes 180
+tc plan --minutes 180 --commit
+~~~
+
+第一条任务通常是 #1，但应以命令返回的 ID 为准；任务、预算、流水、卡、复盘共用 ID 序列。
+
+**API 的 --limit 是累计允许使用的 token 上限，不是剩余余额，也不是每次规划可重复领取的额度。** 例如 strong 上限 50000、实际已用 12000、已预留 8000，最多还能新分配 30000。上限为 0 直接禁用 API；订阅不足时降级。fast 的额度不能补给 strong。默认规划额外保留 10% 安全余量；--reserve-percent 0 才可分配到上限。
+
+| 策略 | 用量选择顺序 |
 |---|---|
-| 重要性、紧迫性 | 1–5 级、截止日期自动提升紧迫性、四象限、可解释优先分 |
-| 任务统筹 | 项目、标签、搜索、状态、依赖 DAG、工作分钟数、截止时间提示 |
-| 多模型偏好 | 每个任务独立的偏序 DAG、传递关系、互不可比模型、允许列表、能力底线 |
-| 强模型用完后降级 | 同一任务分段分配；模型专属 token 倍率；可禁止分段 |
-| 额度 | 每模型独立；同一模型可以同时有短周期、周、滚动或手动窗口 |
-| 预算 | 按任务/模型预留；实际用量抵扣；完成/取消释放；可重规划剩余预算 |
-| 手动用量 | 输入、输出、缓存输入、费用、折算额度；用已用百分比校准 |
-| 重置 | 自然重置按时间计算；Tibo 记录随机刷新；reset 卡管理库存、范围、有效期 |
-| 可视化 | CLI 四象限、额度进度条、工作时间表、每模型每日趋势 |
-| 数据 | 本地 JSON、文件锁、原子替换、上一个版本备份、完整导入导出、撤销错误流水 |
+| subscription-first（默认） | 优先可用订阅；其间按模型偏序选择，订阅候选耗尽后才用各模型自己的 API |
+| model-first | 优先偏好的模型：本模型订阅 → 本模型 API 剩余额度 → 下一可用模型 |
+| subscription-only | 只用订阅，API 配置保留但不参与规划 |
 
-## 建立正式数据
+对于禁止跨模型分段的任务，只在能够完整覆盖剩余工作的模型中选择；同模型订阅和 API 可以共同承担。模型能力底线和允许列表始终是硬约束。
 
-省略 `--data` 时使用系统用户数据目录：Windows 为 `%APPDATA%/tongchou`；其他系统使用 `$XDG_DATA_HOME/tongchou` 或 `~/.local/share/tongchou`。也可设置环境变量 `TONGCHOU_DATA`。`doctor` 显示实际位置。
+## 每天怎么用
 
-下面的额度和能力等级只是演示，不代表任何服务商的真实套餐：
+~~~sh
+tc                         # 任务、模型额度条、续期提示、卡、今日工作分钟
+tc matrix                  # 重要性 × 紧迫性四象限
+tc usage reconcile strong week --percent 70
+tc work log 1 --minutes 45 --model strong --source subscription --input 18000 --output 2000 --done "完成需求拆分" --learned "发现两项接口约束" --next "验证方案" --progress 40
+tc task edit 1 --minutes 60
+tc work summary 1
+tc plan --rebalance --commit
+tc report --days 7
+~~~
 
-```sh
-tongchou init --currency CNY
-tongchou model add chatgpt --provider OpenAI --capability 5
-tongchou model add fallback --provider custom --capability 3
-tongchou model add local --provider local --capability 2
+面板的百分比只是一条观测。订阅周 token 总量是可调整的估计；tc subscription estimate strong 1200000 更新估计，保留原始百分比。工作复盘和实际用量关联，只扣一次；实际耗费不自动等于进度。--minutes 是剩余工作时间，需要自己调整。
 
-tongchou quota add chatgpt short --limit 100000 --period 5h
-tongchou quota add chatgpt week --limit 500000 --period 7d
-tongchou quota add fallback daily --limit 200000 --period 1d
-tongchou quota add local rolling --limit 300000 --kind rolling --period 24h
-```
+~~~sh
+tc credit add --models strong --windows week --count 1 --expires 2026-12-31
+tc credit list
+tc reset --models strong --windows week --credit 7
+tc reset --models strong --windows week --source tibo
+~~~
 
-固定周期默认从添加窗口时起算。知道真实重置时间时，在 `quota add` 中指定 `--next-reset '2026-10-01T18:00:00+08:00'`。`--kind manual` 不带 `--period`，仅在手动登记重置时刷新。周期是固定秒数，`1d` 指 24 小时，**不是**会随夏令时变化的当地日历日。
+卡 ID 7 只是示例，先查看实际 ID。reset 仅登记外部已经发生的刷新；卡扣一次库存，Tibo 不扣卡。自然周重置自动按时间计算。所有订阅重置都不补充 API、不删除历史或未用预留。不能把尚未发生的 Tibo 计入计划。
 
-**未配置窗口的模型按不受限处理**，规划中会显示提示。各模型的定价、能力等级和 token 权重均由用户配置；不存在内置“某品牌永远更强”的判断。
+## 项目与跨机器同步
 
-## 模型偏序与降级
+已有代码仓库继续保存代码；工作空间仓库集中保存任务、用量、上下文、长期记忆和原仓库列表。本机目录绑定独立存放。以下 my-project 是注册项目的稳定名称：
 
-```sh
-tongchou task add '完成重要研究报告' --importance 5 --urgency 4 --minutes 90 --input 24000 --output 8000 --capability 2 --models chatgpt,fallback,local --prefer 'chatgpt>fallback' --prefer 'chatgpt>local' --factor fallback=1.5 --factor local=2
-```
+~~~sh
+tc project register my-project ./my-existing-repo
+tc project note my-project --context "当前目标与约束" --memory "长期约定与关键决策"
+tc task edit 1 --project my-project
+tc project status
+tc project diff my-project
+~~~
 
-这表示：
+先在自己的 GitHub 账号下创建一个**空的私有** schedule-workspace 仓库，再连接：
 
-- `chatgpt` 优于另外两个模型；`fallback` 与 `local` **互不可比**。不会凭空推导二者的优劣。
-- `--capability 2` 是最低能力要求。模型即使便宜、有额度，也不能突破这个硬约束。
-- `--input/--output` 是**整个任务的基准 token 估计**；`fallback=1.5` 表示同样剩余工作估计需要 1.5 倍 token。未指定的模型倍率为 1。
-- 默认允许分段；例如先让强模型完成一部分，再让较弱模型接手。加 `--no-split` 要求剩余工作由一个模型承担。
-- 偏序最高层有多个可用模型时，依次按估算费用、能力等级升序、名称选择，并在输出中解释。希望固定质量顺序时，请显式补充偏序边。
+~~~sh
+tc hub init ../schedule-hub --github YOUR_ACCOUNT
+tc hub status
+tc hub push
+~~~
 
-偏好形成环、依赖形成环、引用不存在的模型或任务时，整个修改会被拒绝，原数据不变。
+--github 只根据账号生成地址，不创建 GitHub 仓库、不处理登录。账号名不是认证凭据；认证复用 Git。日常查看离线，只有明确的同步/检出操作联网。
 
-```sh
-# 查看/更改任务；ID 使用添加命令返回的编号
-tongchou task list --project research
-tongchou task show 1
-tongchou task edit 1 --progress 40 --minutes 50
-tongchou task edit 1 --prefer 'chatgpt>fallback' --prefer 'fallback>local'
-tongchou task status 1 doing
-tongchou task status 1 blocked --note '等待实验结果'
-tongchou task status 1 done
-```
+另一台机器：
 
-`task edit --prefer` 替换全部偏序边，`--factor` 替换全部倍率。清空选项有 `--clear-preferences`、`--clear-factors`、`--clear-depends`、`--clear-due`，取消模型限制用 `--all-models`。取消任务用 `task status ID cancelled`，保留历史；重新打开用 `todo` 或 `doing`。完成会把进度设为 100%，重新打开时按需重新设置进度和剩余分钟数。
+~~~sh
+tc hub clone https://github.com/YOUR_ACCOUNT/schedule-workspace.git ../schedule-hub
+tc hub pull
+tc project bind my-project ./existing-checkout
+# 或从原仓库克隆到新目录：
+tc project checkout my-project --to ./new-checkout
+~~~
 
-## 每日协作循环
+没有原远程仓库的项目默认 snapshot 模式：先在原项目提交代码，再 tc project snapshot NAME，随后 hub push；恢复使用 project checkout。快照包含 HEAD 可达的提交历史，限 90 MiB，不含未提交/忽略文件、其他分支、子模块内容或 LFS 实体。大项目适合 reference 模式。
 
-```sh
-# 1. 校准模型面板上看到的已用量，百分比指“已用”
-tongchou usage reconcile chatgpt short --percent 80
+采用“离开设备前 push，到新设备先 pull”的工作流。双端都改了状态时停止同步，避免静默覆盖；目前不自动合并离线编辑。--replace 明确接受远端状态前，先 export 留下独立备份。
 
-# 2. 预览并提交今天/这次工作的计划
-tongchou plan --minutes 180 --reserve-percent 10
-tongchou plan --minutes 180 --reserve-percent 10 --commit
+## 文档与实现
 
-# 3. 工作后分别登记真实消耗和实际进度
-tongchou usage log chatgpt --task 1 --input 5000 --output 1200 --cached 2000 --progress 25
-tongchou task edit 1 --minutes 70
+- [落地设计与完整工作流](docs/IMPLEMENTATION_V2.md)
+- [CLI 指令清单](docs/CLI.md)
+- [维护的数据结构与存储布局](docs/DATA_MODEL.md)
+- [数学定义、资源约束与降级算例](docs/MATHEMATICS.md)
+- [长期设计决策](docs/DECISIONS.md)
+- [模块架构](docs/ARCHITECTURE.md)、[验证记录](docs/VALIDATION.md)、[后续计划](docs/ROADMAP.md)
 
-# 4. 强模型额度变化，重新分配剩余工作
-tongchou usage reconcile chatgpt short --percent 100
-tongchou plan --minutes 180 --rebalance
-tongchou plan --minutes 180 --rebalance --commit
-```
+规划是确定性的优先级贪心，默认仅预览，不声称全局最优；--commit 才保存预算。--rebalance 会释放所选范围的未用预留再规划，历史消耗保持原模型/来源。
 
-**用掉 25% 的 token 不等于完成 25% 的任务。** `--progress` 是手动确认的绝对完成百分比，而非本次增量；如果未提供，记用量不会改变进度。`--minutes` 是剩余工作时间，不会随进度自动缩短。实际费用与原始 token 统计不会因为重规划而消失。
+数据目录：Windows 为 %APPDATA%/schedule；其他平台优先 $XDG_DATA_HOME/schedule，再使用 ~/.local/share/schedule。--data 或 SCHEDULE_DATA 可覆盖；自动兼容旧 tongchou 数据目录和 TONGCHOU_DATA。v1 数据读取时迁移，下一次保存保留旧文件为 state.json.bak。备份含个人工作内容，请使用个人位置保存。
 
-默认规划保留已有预留，只补足不足部分。`--rebalance` 在工作副本中释放所选范围内所有未用预算，再重新安排；仅有 `--commit` 才保存。**被暂缓或阻塞的范围内任务也会释放旧预留。** `--project` 可以缩小范围，范围外预算仍占用额度。
-
-任务按优先级、依赖、时间和额度进行贪心排程；只有剩余任务能够完整安排时才接受该任务。试分配后仍不足会全部回滚该任务的新增预算，再尝试后续任务。因此一个尚不能完整安排的大任务不会吞掉所有额度。它不是全局最优求解器，也不预支未来的自然重置或偶然刷新。
-
-## 预算和用量
-
-```sh
-tongchou budget set 1 chatgpt --input 12000 --output 3000
-tongchou budget list --task 1
-tongchou budget release 1 --model chatgpt
-tongchou usage list --model chatgpt --last 30
-tongchou usage void 12
-tongchou report --days 14
-```
-
-`budget set` 设置的是**现在起的剩余预留**，同一任务/模型的旧预算会被替换。超配默认拒绝，只有显式 `--force` 才保留超配记录。超配会在总览警示，默认规划要求先调整或重规划。
-
-缓存输入包含在 `--input` 内，不能重复计入总输入。手填费用使用 `--cost`，模型价格使用 `model add/edit --input-price/--output-price/--cached-price`，单位是当前统一货币/百万 token。不提供价格则按 0 估算；程序不做汇率换算。
-
-供应商额度不是 token 时，可配置本模型的额度换算：
-
-```sh
-tongchou model add point-model --unit points --input-weight 0.001 --output-weight 0.003
-tongchou quota add point-model week --limit 1000 --period 7d
-tongchou usage log point-model --input 1000 --output 500 --units 4.7
-tongchou usage reconcile point-model week --used 630
-```
-
-权重必须由用户估计；不能从面板百分比推导真实 token 兑换率。`--units` 覆盖这条流水消耗的本模型额度；原始 token 和费用仍独立保留。
-
-校准是当前窗口的权威快照，覆盖此前的额度估计，不抹去历史 token/费用。只校准一个窗口时，其他窗口不变。滚动窗口无法从总数知道每笔到期时间，快照按整批在一个周期后到期做保守估计并标 `~`。
-
-历史补记可用 `usage log --at '2026-09-21T09:30:00+08:00'`；拒绝未来用量。补记时间早于快照时，快照继续作为额度基线；早于预算创建时间的用量不抵扣该预算。`usage void` 保留审计记录、重新计算统计和预算，但不会撤回手动修改的进度，也不会改写之后的权威快照。刷新流水不可撤销，可用新校准纠正。
-
-## 自然重置、Tibo、reset 卡
-
-| 类型 | 如何处理 |
-|---|---|
-| 自然固定周期 | 根据周期边界自动计算，不需要后台进程；不累计没用完的额度 |
-| 滚动窗口 | 每条用量分别在一个周期后释放 |
-| Tibo | 不可预测的外部自动刷新，观察到后登记；不扣卡，也不提前当成可用额度 |
-| reset 卡 | 手动登记库存，可限定模型、窗口和有效期；登记一次兑换消耗一次机会 |
-
-```sh
-# 观察到 Tibo 刷新，仅刷新发生变化的模型/窗口
-tongchou reset --models chatgpt --windows short --source tibo --note '面板已刷新'
-
-# 登记卡；使用返回的 ID 兑换，下面假设返回 15
-tongchou credit add --count 2 --models chatgpt --expires '2026-12-31' --note '获赠 reset 卡'
-tongchou credit list
-tongchou reset --models chatgpt --credit 15
-```
-
-不填 `--windows` 会清零所选模型的所有窗口；可用逗号选择多个模型，但它们仍独立清零、独立计费。卡的范围必须覆盖全部目标，一次命令消耗一张卡。默认保留原自然重置时间；只有确知时钟重新起算时才加 `--restart-clock`。刷新不会释放任务预留，不会清零历史累计用量或费用。
-
-## 可视化与脚本接口
-
-```text
-模型/窗口       用量 / 预留           已用%  已用+预留 / 限额
-chatgpt/short   [██████████░░░·····]  56%    56k+18k / 100k token
-fallback/day   [██░░░░░···········]  10%    20k+60k / 200k token
-```
-
-`matrix` 为四象限；`plan` 显示时间安排、各段模型和降级原因；`report` 每个模型分别显示近期统计和每日字符趋势。所有命令接受全局 `--json`。正常运行退出码为 0，参数或操作失败为 2，操作错误 JSON 写入标准错误；命令行解析错误保留 clap 的标准错误格式。
-
-```sh
-tongchou --json task list
-tongchou --json quota list
-tongchou export backup.json
-tongchou import backup.json --replace
-tongchou doctor
-```
-
-修改会先校验、再原子替换 `state.json`，并保留上一次可用文件 `state.json.bak`。文件损坏时拒绝默默覆盖，可用 `import BACKUP --replace` 恢复；恢复时损坏原件保存为 `state.json.corrupt`，不会破坏上一份可用备份。备份包含任务和备注，按个人数据保管。执行过程中持有目录锁，第二个写入/读取进程会快速失败，避免读到半次事务。未产生改动的预览不会重写数据。
-
-## 设计与开发
-
-- [数学模型、偏序、降级和重规划](docs/MATHEMATICS.md)
-- [设计决策及用户约束](docs/DECISIONS.md)
-- [数据格式与架构](docs/ARCHITECTURE.md)
-- [迭代路线](docs/ROADMAP.md)
-- [版本记录](CHANGELOG.md)
-
-```sh
+~~~sh
+tc doctor
+tc export ./schedule-backup.json
+tc import ./schedule-backup.json --replace
 cargo fmt --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
-cargo build --release --locked
-```
+~~~
 
-依赖 API 参考：[clap 参数解析](https://docs.rs/clap/latest/clap/)、[chrono 时间处理](https://docs.rs/chrono/latest/chrono/)、[fs2 文件锁](https://docs.rs/fs2/latest/fs2/trait.FileExt.html)。项目采用 MIT 许可证。
+未来会扩展周容量学习、任务用量预测、自动采集与多设备实体级合并；本版保留观测和复盘资料，尚不实现预测。

@@ -5,7 +5,7 @@ use std::{
 };
 
 fn invoke(dir: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tongchou"))
+    Command::new(env!("CARGO_BIN_EXE_schedule"))
         .arg("--data")
         .arg(dir)
         .arg("--json")

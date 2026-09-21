@@ -1,12 +1,28 @@
 [package]
-name = "tongchou"
-version = "0.1.0"
+name = "schedule"
+version = "0.2.0"
+default-run = "schedule"
 edition = "2024"
 rust-version = "1.85"
-description = "离线任务统筹、多模型 token 预算与重置额度管理 CLI"
+description = "任务统筹、多模型用量规划与 Git 工作空间同步 CLI"
 license = "MIT"
 repository = "https://github.com/ZEPHYR65537/rustychedule"
 readme = "README.md"
+
+[lib]
+name = "schedule"
+
+[[bin]]
+name = "schedule"
+path = "src/main.rs"
+
+[[bin]]
+name = "tc"
+path = "src/bin/tc.rs"
+
+[[bin]]
+name = "tongchou"
+path = "src/bin/tongchou.rs"
 
 [dependencies]
 anyhow = "1"
@@ -17,6 +33,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 unicode-width = "0.2"
+sha2 = "0.10"
 
 [profile.release]
 lto = "thin"

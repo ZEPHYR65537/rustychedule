@@ -1,5 +1,10 @@
 use crate::{
+    commands::{
+        self, ApiCommand, HubCommand, PolicyCommand, ProjectCommand, SubscriptionCommand,
+        WorkCommand,
+    },
     domain::*,
+    ledger::Funding,
     planner,
     store::{Store, atomic_write},
     ui,
@@ -12,14 +17,14 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "tongchou",
+    name = "schedule",
     version,
     about = "统筹：任务优先级 × 独立模型额度 × token 预算",
-    after_help = "不带子命令显示总览。所有记录保存在本机，不会调用模型或兑换真实重置卡。\n快速体验：tongchou --data .demo init --demo\n帮助示例：tongchou task add --help"
+    after_help = "短命令 tc 与 schedule 完全等价。不带子命令显示总览。\n快速体验：tc --data demo init --demo\n日常：tc task add / tc plan / tc work log / tc project status / tc hub push"
 )]
 pub struct Cli {
     /// 数据目录（默认使用系统用户数据目录）
-    #[arg(long, global = true, env = "TONGCHOU_DATA")]
+    #[arg(long, global = true, env = "SCHEDULE_DATA")]
     pub data: Option<PathBuf>,
     /// 输出机器可读 JSON
     #[arg(long, global = true)]
@@ -29,12 +34,40 @@ pub struct Cli {
 }
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// 订阅续期日、估计周额度
+    Subscription {
+        #[command(subcommand)]
+        command: SubscriptionCommand,
+    },
+    /// 每个模型独立购买的 API token 上界和补充库存
+    Api {
+        #[command(subcommand)]
+        command: ApiCommand,
+    },
+    /// 全局模型偏序与订阅/API 选择策略
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
+    /// 工作时间、token、完成内容与收获记账
+    Work {
+        #[command(subcommand)]
+        command: WorkCommand,
+    },
+    /// 注册原代码仓库、统一查看更改、维护上下文与记忆
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
+    /// 通过独立工作空间 Git 仓库跨机器同步
+    Hub {
+        #[command(subcommand)]
+        command: HubCommand,
+    },
     /// 初始化；--demo 仅向空目录写入示例
     Init {
         #[arg(long)]
         demo: bool,
-        #[arg(long, default_value = "CNY")]
-        currency: String,
     },
     /// 总览：任务、每个模型独立额度、重置机会
     Dashboard,
@@ -86,7 +119,7 @@ pub enum Command {
         #[arg(long)]
         rebalance: bool,
     },
-    /// 按模型显示近期用量、费用和每日趋势
+    /// 按模型显示近期用量和每日趋势
     Report {
         #[arg(long, default_value_t = 7)]
         days: u32,
@@ -241,13 +274,6 @@ pub struct ModelAdd {
     pub provider: String,
     #[arg(long, default_value_t = 3)]
     pub capability: u8,
-    /// 每百万输入 token 的价格，使用数据文件的统一货币
-    #[arg(long, default_value_t = 0.0)]
-    pub input_price: f64,
-    #[arg(long, default_value_t = 0.0)]
-    pub output_price: f64,
-    #[arg(long, default_value_t = 0.0)]
-    pub cached_price: f64,
     /// 额度单位标签；默认为 token，可用 units/points 等
     #[arg(long, default_value = "token")]
     pub unit: String,
@@ -264,12 +290,6 @@ pub struct ModelEdit {
     pub provider: Option<String>,
     #[arg(long)]
     pub capability: Option<u8>,
-    #[arg(long)]
-    pub input_price: Option<f64>,
-    #[arg(long)]
-    pub output_price: Option<f64>,
-    #[arg(long)]
-    pub cached_price: Option<f64>,
     /// 显式 true/false；停用后保留历史
     #[arg(long,action=clap::ArgAction::Set)]
     pub enabled: Option<bool>,
@@ -311,6 +331,8 @@ pub enum BudgetCommand {
     Set {
         task: u64,
         model: String,
+        #[arg(long, value_enum, default_value = "subscription")]
+        source: Funding,
         #[arg(long, default_value_t = 0)]
         input: u64,
         #[arg(long, default_value_t = 0)]
@@ -332,6 +354,8 @@ pub enum BudgetCommand {
 pub enum UsageCommand {
     Log {
         model: String,
+        #[arg(long, value_enum, default_value = "subscription")]
+        source: Funding,
         #[arg(long)]
         task: Option<u64>,
         #[arg(long, default_value_t = 0)]
@@ -344,8 +368,6 @@ pub enum UsageCommand {
         /// 覆盖本条消耗的模型额度单位；不影响原始 token 数
         #[arg(long)]
         units: Option<f64>,
-        #[arg(long)]
-        cost: Option<f64>,
         #[arg(long)]
         at: Option<String>,
         /// 同时更新任务的绝对完成百分比；不根据 token 消耗自动推断
@@ -424,17 +446,17 @@ pub struct Response {
     pub text: String,
     pub changed: bool,
 }
-fn response(value: Value, text: String, changed: bool) -> Response {
+pub(crate) fn response(value: Value, text: String, changed: bool) -> Response {
     Response {
         value,
         text,
         changed,
     }
 }
-fn ok(message: String, id: Option<u64>) -> Response {
+pub(crate) fn ok(message: String, id: Option<u64>) -> Response {
     response(json!({"message":message,"id":id}), message, true)
 }
-fn preference_edges(values: &[String]) -> Result<Vec<[String; 2]>> {
+pub(crate) fn preference_edges(values: &[String]) -> Result<Vec<[String; 2]>> {
     values
         .iter()
         .map(|s| {
@@ -453,6 +475,12 @@ fn is_empty(s: &State) -> bool {
         && s.credits.is_empty()
         && s.pools.is_empty()
         && s.budgets.is_empty()
+        && s.projects.is_empty()
+        && s.sessions.is_empty()
+        && s.accounts.is_empty()
+        && s.model_preferences.is_empty()
+        && s.funding_policy == Default::default()
+        && s.next_id == 1
 }
 fn factors(values: &[String]) -> Result<BTreeMap<String, f64>> {
     values
@@ -466,21 +494,26 @@ fn factors(values: &[String]) -> Result<BTreeMap<String, f64>> {
 
 pub fn execute(command: Command, s: &mut State, store: &Store, now: Time) -> Result<Response> {
     match command {
-        Command::Init { demo, currency } => {
+        Command::Subscription { command } => commands::subscription(command, s, now),
+        Command::Api { command } => commands::api(command, s, now),
+        Command::Policy { command } => commands::policy(command, s),
+        Command::Work { command } => commands::work(command, s, now),
+        Command::Project { command } => commands::project(command, s, store),
+        Command::Hub { command } => commands::hub(command, s, store),
+        Command::Init { demo } => {
             ensure!(
                 is_empty(s),
                 "数据非空，init 不会覆盖现有数据；体验示例请指定新的 --data 目录"
             );
-            s.currency = currency;
             if demo {
-                *s = demo_state(now, &s.currency)?;
+                *s = demo_state(now)?;
             }
             Ok(ok(
                 format!(
                     "已初始化 {}{}",
                     store.dir.display(),
                     if demo {
-                        "（示例数据，所有价格和额度均为虚构）"
+                        "（示例数据，额度均为虚构）"
                     } else {
                         ""
                     }
@@ -505,14 +538,16 @@ pub fn execute(command: Command, s: &mut State, store: &Store, now: Time) -> Res
             BudgetCommand::Set {
                 task,
                 model,
+                source,
                 input,
                 output,
                 force,
             } => {
-                let id = s.budget_set(task, &model, input, output, now, force)?;
+                let id = s.budget_set_funded(task, &model, (input, output), source, now, force)?;
                 Ok(ok(
                     format!(
-                        "已预留预算 #{id}：任务 #{task} / {model}，输入 {input}、输出 {output} token"
+                        "已预留预算 #{id}：任务 #{task} / {model} / {}，输入 {input}、输出 {output} token",
+                        source.label()
                     ),
                     Some(id),
                 ))
@@ -539,7 +574,7 @@ pub fn execute(command: Command, s: &mut State, store: &Store, now: Time) -> Res
                     .filter(|b| !b.released && task.is_none_or(|t| t == b.task))
                     .map(|b| {
                         let (i, o) = s.remaining_budget(b, now);
-                        json!({"id":b.id,"task":b.task,"model":b.model,"input":i,"output":o})
+                        json!({"id":b.id,"task":b.task,"model":b.model,"source":b.funding,"input":i,"output":o})
                     })
                     .collect();
                 Ok(response(json!(rows), ui::budget_rows(&rows), false))
@@ -625,7 +660,7 @@ pub fn execute(command: Command, s: &mut State, store: &Store, now: Time) -> Res
                 planner::commit(&mut working, &p)?;
                 *s = working;
             }
-            let mut text = ui::plan(&p, &s.currency, commit);
+            let mut text = ui::plan(&p, commit);
             if rebalance {
                 text.push_str(
                     "\n本次已重算范围内的所有未用预算；暂缓任务的旧预留也会在提交后释放。\n",
@@ -640,7 +675,7 @@ pub fn execute(command: Command, s: &mut State, store: &Store, now: Time) -> Res
         Command::Report { days } => {
             ensure!((1..=3660).contains(&days), "统计天数须为 1–3660");
             let v = ui::report_data(s, now, days);
-            Ok(response(v.clone(), ui::report(&v, &s.currency), false))
+            Ok(response(v.clone(), ui::report(&v), false))
         }
         Command::Export { path, force } => {
             ensure!(
@@ -836,9 +871,9 @@ fn task_command(command: TaskCommand, s: &mut State, now: Time) -> Result<Respon
         }
         TaskCommand::Show { id } => {
             let t = s.task(id)?;
-            let (i, o, c) = s.task_usage(id, now);
+            let (i, o) = s.task_usage(id, now);
             Ok(response(
-                json!({"task":t,"actual_input":i,"actual_output":o,"actual_cost":c}),
+                json!({"task":t,"actual_input":i,"actual_output":o}),
                 ui::task_detail(s, t, now),
                 false,
             ))
@@ -859,9 +894,6 @@ fn model_command(command: ModelCommand, s: &mut State) -> Result<Response> {
                 provider: a.provider,
                 capability: a.capability,
                 enabled: true,
-                input_price: a.input_price,
-                output_price: a.output_price,
-                cached_price: a.cached_price,
                 bindings: vec![Binding {
                     pool: a.name.clone(),
                     input_weight: a.input_weight,
@@ -888,15 +920,6 @@ fn model_command(command: ModelCommand, s: &mut State) -> Result<Response> {
             if let Some(v) = a.capability {
                 m.capability = v;
             }
-            if let Some(v) = a.input_price {
-                m.input_price = v;
-            }
-            if let Some(v) = a.output_price {
-                m.output_price = v;
-            }
-            if let Some(v) = a.cached_price {
-                m.cached_price = v;
-            }
             if let Some(v) = a.enabled {
                 m.enabled = v;
             }
@@ -907,7 +930,7 @@ fn model_command(command: ModelCommand, s: &mut State) -> Result<Response> {
                 m.bindings[0].output_weight = v;
             }
             Ok(ok(
-                "模型已更新；历史用量及当时费用不变，当前预算按新权重折算".into(),
+                "模型已更新；历史用量不变，当前预算按新权重折算".into(),
                 None,
             ))
         }
@@ -999,12 +1022,12 @@ fn usage_command(command: UsageCommand, s: &mut State, now: Time) -> Result<Resp
     match command {
         UsageCommand::Log {
             model,
+            source,
             task,
             input,
             output,
             cached,
             units,
-            cost,
             at,
             progress,
             note,
@@ -1014,13 +1037,21 @@ fn usage_command(command: UsageCommand, s: &mut State, now: Time) -> Result<Resp
             if let Some(t) = task {
                 s.task(t)?;
             }
-            let m = s.model(&model)?;
-            let amount = units.unwrap_or_else(|| m.bindings[0].units(input, output));
-            nonnegative(amount)?;
-            let cost = cost.unwrap_or_else(|| m.cost(input, output, cached));
-            nonnegative(cost)?;
+            s.model(&model)?;
             ensure!(
-                input > 0 || output > 0 || amount > 0.0 || cost > 0.0,
+                source != Funding::Api || units.is_none(),
+                "API 固定按输入+输出 token 计量，不接受 --units"
+            );
+            if source == Funding::Api {
+                ensure!(
+                    s.accounts.contains_key(&model),
+                    "请先用 api set 配置 API token 上界（历史用量可如实记录为超限）"
+                );
+            }
+            let amount = units.unwrap_or_else(|| s.funding_units(&model, source, input, output));
+            nonnegative(amount)?;
+            ensure!(
+                input > 0 || output > 0 || amount > 0.0,
                 "空用量记录无须保存"
             );
             let at = at
@@ -1034,13 +1065,14 @@ fn usage_command(command: UsageCommand, s: &mut State, now: Time) -> Result<Resp
                 at,
                 note,
                 voided: false,
+                funding: source,
+                observed_percent: None,
                 kind: EventKind::Usage {
                     task,
                     model: model.clone(),
                     input,
                     output,
                     cached,
-                    cost,
                     units: BTreeMap::from([(model.clone(), amount)]),
                 },
             });
@@ -1055,10 +1087,10 @@ fn usage_command(command: UsageCommand, s: &mut State, now: Time) -> Result<Resp
                 .map(|q| format!("{}/{} 用量+预留已超限", q.pool, q.window))
                 .collect();
             Ok(response(
-                json!({"id":id,"cost":cost,"warnings":warnings}),
+                json!({"id":id,"warnings":warnings}),
                 format!(
-                    "已记用量 #{id}：{model}，输入 {input} / 输出 {output}，费用 {cost:.4} {}{}",
-                    s.currency,
+                    "已记用量 #{id}：{model} / {}，输入 {input} / 输出 {output}{}",
+                    source.label(),
                     if warnings.is_empty() {
                         String::new()
                     } else {
@@ -1098,6 +1130,8 @@ fn usage_command(command: UsageCommand, s: &mut State, now: Time) -> Result<Resp
                 at: now,
                 note,
                 voided: false,
+                funding: Default::default(),
+                observed_percent: percent,
                 kind: EventKind::Snapshot {
                     pool: model,
                     window,
@@ -1155,24 +1189,18 @@ fn usage_command(command: UsageCommand, s: &mut State, now: Time) -> Result<Resp
     }
 }
 
-pub fn demo_state(now: Time, currency: &str) -> Result<State> {
-    let mut s = State {
-        currency: currency.into(),
-        ..State::default()
-    };
-    for (name, cap, limit, ip, op) in [
-        ("deep", 5, 120_000.0, 12.0, 48.0),
-        ("fast", 3, 240_000.0, 1.0, 4.0),
-        ("local", 2, 500_000.0, 0.0, 0.0),
+pub fn demo_state(now: Time) -> Result<State> {
+    let mut s = State::default();
+    for (name, cap, limit) in [
+        ("deep", 5, 120_000.0),
+        ("fast", 3, 240_000.0),
+        ("local", 2, 500_000.0),
     ] {
         s.models.push(Model {
             name: name.into(),
             provider: "示例（非真实套餐）".into(),
             capability: cap,
             enabled: true,
-            input_price: ip,
-            output_price: op,
-            cached_price: ip / 4.0,
             bindings: vec![Binding {
                 pool: name.into(),
                 input_weight: 1.0,
@@ -1276,13 +1304,14 @@ pub fn demo_state(now: Time, currency: &str) -> Result<State> {
         at: now - Duration::minutes(30),
         note: "之前的实际用量".into(),
         voided: false,
+        funding: Default::default(),
+        observed_percent: None,
         kind: EventKind::Usage {
             task: None,
             model: "deep".into(),
             input: 60_000,
             output: 24_000,
             cached: 0,
-            cost: 1.872,
             units: BTreeMap::from([("deep".into(), 84_000.0)]),
         },
     });
@@ -1304,7 +1333,11 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let json_output = cli.json;
     let result = (|| -> Result<Response> {
-        let store = Store::open(cli.data.unwrap_or_else(crate::store::default_dir))?;
+        let store = Store::open(
+            cli.data
+                .or_else(|| std::env::var_os("TONGCHOU_DATA").map(PathBuf::from))
+                .unwrap_or_else(crate::store::default_dir),
+        )?;
         // Import is the explicit recovery path and must work even if the live file is corrupt.
         let command = cli.command.unwrap_or(Command::Dashboard);
         let mut state = if matches!(command, Command::Import { replace: true, .. }) {
@@ -1341,5 +1374,14 @@ pub fn run() -> Result<()> {
             }
             bail!("__reported__")
         }
+    }
+}
+
+pub fn main_entry() {
+    if let Err(e) = run() {
+        if e.to_string() != "__reported__" {
+            eprintln!("错误：{e:#}");
+        }
+        std::process::exit(2);
     }
 }
